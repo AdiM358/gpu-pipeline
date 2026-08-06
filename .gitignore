@@ -1,0 +1,22 @@
+# Verilator build output directories
+obj_dir/
+obj_dir_*/
+build/
+
+# GTKWave / Simulation waveform traces
+*.vcd
+*.fst
+
+# C++ build artifacts and binary outputs
+*.o
+*.a
+*.so
+*.exe
+
+# C++ Intellisense / Language Server cache
+.clangd/
+.cache/
+.vscode/
+
+# Temporary / Log files
+*.log
