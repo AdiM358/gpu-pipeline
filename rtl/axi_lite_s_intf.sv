@@ -1,5 +1,7 @@
+`default_nettype none
+
 module axi_lite_s_intf #(
-    parameter integer S_AXI_ADDR_WIDTH = 6, // 6 bits for 64-byte address space (16 regs)
+    parameter integer S_AXI_ADDR_WIDTH = 7, // 7 bits for 128-byte address space
     parameter integer S_AXI_DATA_WIDTH = 32
 )(
     // Clock and reset
@@ -30,30 +32,26 @@ module axi_lite_s_intf #(
     output logic signed [31:0] mvp_matrix [0:3][0:3]
 );
 
-    // 16 x 32-bit register array
-    logic [S_AXI_DATA_WIDTH-1:0] reg_file [0:15];
+    // 20 x 32-bit register array (Regs 0..3 for control, Regs 4..19 for 4x4 matrix)
+    logic [S_AXI_DATA_WIDTH-1:0] reg_file [0:19];
     
     // Latched write address
-    logic [3:0] write_reg_idx;
+    logic [4:0] write_reg_idx;
 
     // Fixed OKAY response
     assign S_AXI_BRESP = 2'b00;
 
     // Address decoding (Word aligned: drop lower 2 bits)
-    assign write_reg_idx = S_AXI_WRITE_ADDR[5:2];
+    assign write_reg_idx = S_AXI_WRITE_ADDR[6:2];
 
     // Control and status register assignments
-    // Reg 0: Control register (bit 0 = start pulse)
-    // Reg 1: Vertex buffer base address in VRAM
-    // Reg 2: Total number of vertices to render
     assign vbuf_base_addr = reg_file[1];
     assign vertex_count   = reg_file[2];
 
-    // Regs 4 to 15: 4x4 MVP Matrix map
+    // Regs 4 to 19: 4x4 MVP Matrix map
     always_comb begin
         for (int r = 0; r < 4; r++) begin
             for (int c = 0; c < 4; c++) begin
-                // Flatten row-major order into registers 4 through 15
                 mvp_matrix[r][c] = reg_file[4 + (r * 4) + c];
             end
         end
@@ -67,7 +65,7 @@ module axi_lite_s_intf #(
             S_AXI_BVALID           <= 1'b0;
             start_pulse            <= 1'b0;
 
-            for (int i = 0; i < 16; i++) begin
+            for (int i = 0; i < 20; i++) begin
                 reg_file[i] <= '0;
             end
         end else begin
@@ -85,11 +83,13 @@ module axi_lite_s_intf #(
 
             // Write payload on handshake cycle AND assert BVALID
             if (S_AXI_WRITE_ADDR_VALID && S_AXI_WRITE_DATA_VALID && !S_AXI_BVALID) begin
-                reg_file[write_reg_idx] <= S_AXI_WRITE_DATA;
-                S_AXI_BVALID            <= 1'b1;
+                if (write_reg_idx < 20) begin
+                    reg_file[write_reg_idx] <= S_AXI_WRITE_DATA;
+                end
+                S_AXI_BVALID <= 1'b1;
 
                 // Trigger self-clearing start pulse on reg 0 write if bit 0 is high
-                if (write_reg_idx == 4'h0 && S_AXI_WRITE_DATA[0]) begin
+                if (write_reg_idx == 5'h0 && S_AXI_WRITE_DATA[0]) begin
                     start_pulse <= 1'b1;
                 end
             end
@@ -102,3 +102,5 @@ module axi_lite_s_intf #(
     end
 
 endmodule
+
+`default_nettype wire
