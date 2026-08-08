@@ -44,9 +44,27 @@ run_persp:
 	make -C $(BUILD_DIR)/persp -f Vpersp_viewport.mk Vpersp_viewport
 	./$(BUILD_DIR)/persp/Vpersp_viewport
 
+run_prim:
+	mkdir -p $(BUILD_DIR)/prim
+	verilator -Wall --cc --trace --exe \
+		-I$(RTL_DIR) \
+		$(RTL_DIR)/prim_assembly.sv $(TB_DIR)/prim_assembly_tb.cpp \
+		--top-module prim_assembly -Mdir $(BUILD_DIR)/prim
+	make -C $(BUILD_DIR)/prim -f Vprim_assembly.mk Vprim_assembly
+	./$(BUILD_DIR)/prim/Vprim_assembly
+
+run_rast:
+	mkdir -p $(BUILD_DIR)/rast
+	verilator -Wall --cc --trace --exe \
+		-I$(RTL_DIR) \
+		$(RTL_DIR)/rasterizer.sv $(TB_DIR)/rasterizer_tb.cpp \
+		--top-module rasterizer -Mdir $(BUILD_DIR)/rast
+	make -C $(BUILD_DIR)/rast -f Vrasterizer.mk Vrasterizer
+	./$(BUILD_DIR)/rast/Vrasterizer
+
 run_top:
 	mkdir -p $(BUILD_DIR)/top
-	verilator -Wall --cc --trace --exe \
+	verilator -Wall --cc --trace --exe --public-flat-rw \
 		-I$(RTL_DIR) \
 		$(RTL_DIR)/gpu_top.sv $(TB_DIR)/gpu_top_tb.cpp \
 		--top-module gpu_top -Mdir $(BUILD_DIR)/top

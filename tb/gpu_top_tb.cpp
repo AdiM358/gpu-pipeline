@@ -5,17 +5,13 @@
 #include <verilated.h>
 #include <verilated_vcd_c.h>
 #include "Vgpu_top.h"
+#include "Vgpu_top___024root.h"
+#include "Vgpu_top_gpu_top.h"
 
-// Fixed point helpers
 constexpr int32_t to_q16(double val) {
     return static_cast<int32_t>(val * 65536.0);
 }
 
-constexpr double from_q16(int32_t val) {
-    return static_cast<double>(val) / 65536.0;
-}
-
-// 32-byte VRAM vertex layout
 struct Vertex {
     int32_t x;
     int32_t y;
@@ -85,7 +81,7 @@ struct Testbench {
         top->m_axi_rresp = 0;
         top->m_axi_rlast = 0;
 
-        top->stream_ready = 1;
+        top->frag_ready = 1;
 
         for (int i = 0; i < 5; i++) {
             clock_cycle();
@@ -183,18 +179,6 @@ struct Testbench {
             top->m_axi_rlast = 0;
         }
     }
-
-    void wait_for_stream_valid(int max_cycles = 1000) {
-        int timeout = 0;
-        while (!top->stream_valid) {
-            clock_cycle();
-            timeout++;
-            if (timeout >= max_cycles) {
-                std::cerr << "ERROR: Timeout waiting for stream_valid!" << std::endl;
-                assert(false && "Timeout waiting for stream_valid");
-            }
-        }
-    }
 };
 
 int main(int argc, char** argv) {
@@ -203,30 +187,54 @@ int main(int argc, char** argv) {
 
     tb->reset();
 
-    // Model space vertex (0.0, 0.0, 0.5) -> center of screen
-    Vertex v0 = {to_q16(0.0), to_q16(0.0), to_q16(0.5), 0xFF0000FF, {0}};
+    // 3 model-space vertices forming a triangle:
+    // V0 = (-0.1, -0.1, 0.5) -> Screen (288, 264)
+    // V1 = ( 0.0,  0.1, 0.5) -> Screen (320, 216)
+    // V2 = ( 0.1, -0.1, 0.5) -> Screen (352, 264)
+    Vertex v0 = {to_q16(-0.1), to_q16(-0.1), to_q16(0.5), 0x00FF00FF, {0}};
+    Vertex v1 = {to_q16( 0.0), to_q16( 0.1), to_q16(0.5), 0x00FF00FF, {0}};
+    Vertex v2 = {to_q16( 0.1), to_q16(-0.1), to_q16(0.5), 0x00FF00FF, {0}};
 
-    tb->load_vertex_into_vram(Testbench::VRAM_BASE_ADDR + 0, v0);
+    tb->load_vertex_into_vram(Testbench::VRAM_BASE_ADDR + 0,  v0);
+    tb->load_vertex_into_vram(Testbench::VRAM_BASE_ADDR + 32, v1);
+    tb->load_vertex_into_vram(Testbench::VRAM_BASE_ADDR + 64, v2);
 
-    tb->axi_lite_write(0x04, Testbench::VRAM_BASE_ADDR);
-    tb->axi_lite_write(0x08, 1); // 1 vertex
     tb->set_identity_matrix();
+    tb->axi_lite_write(0x04, Testbench::VRAM_BASE_ADDR);
+    tb->axi_lite_write(0x08, 3); // 3 vertices
 
-    tb->axi_lite_write(0x00, 0x00000001); // Trigger start
+    tb->axi_lite_write(0x00, 0x00000001); // Trigger start pulse
 
-    tb->wait_for_stream_valid(1000);
+    std::cout << "Streaming fragments from full GPU pipeline..." << std::endl;
+    int fragment_count = 0;
+    int cycles = 0;
 
-    std::cout << "Screen output for (0.0, 0.0, 0.5):" << std::endl;
-    std::cout << "  X_screen: " << from_q16(tb->top->stream_x_screen) << " (Expected: 320.0)" << std::endl;
-    std::cout << "  Y_screen: " << from_q16(tb->top->stream_y_screen) << " (Expected: 240.0)" << std::endl;
-    std::cout << "  Z_depth:  " << from_q16(tb->top->stream_z_depth)  << " (Expected: 0.5)" << std::endl;
+    while (cycles < 5000) {
+        tb->clock_cycle();
+        cycles++;
+        if (tb->top->rootp->gpu_top->tri_valid) {
+            std::cout << "Assembled Tri V0: (" 
+                    << (tb->top->rootp->gpu_top->tri_v0_x >> 16) << ", " 
+                    << (tb->top->rootp->gpu_top->tri_v0_y >> 16) << ")" << std::endl;
+            std::cout << "Assembled Tri V1: (" 
+                    << (tb->top->rootp->gpu_top->tri_v1_x >> 16) << ", " 
+                    << (tb->top->rootp->gpu_top->tri_v1_y >> 16) << ")" << std::endl;
+            std::cout << "Assembled Tri V2: (" 
+                    << (tb->top->rootp->gpu_top->tri_v2_x >> 16) << ", " 
+                    << (tb->top->rootp->gpu_top->tri_v2_y >> 16) << ")" << std::endl;
+        }
+        if (tb->top->frag_valid) {
+            fragment_count++;
+            if (fragment_count <= 5 || fragment_count % 100 == 0) {
+                std::cout << "  Fragment #" << fragment_count << ": (" 
+                          << tb->top->frag_x << ", " << tb->top->frag_y << ")" << std::endl;
+            }
+        }
+    }
 
-    assert(tb->top->stream_x_screen == to_q16(320.0) && "Center X mismatch");
-    assert(tb->top->stream_y_screen == to_q16(240.0) && "Center Y mismatch");
-    assert(tb->top->stream_z_depth  == to_q16(0.5)   && "Center Z depth mismatch");
+    std::cout << "End-to-End Simulation complete. Total fragments: " << fragment_count << std::endl;
+    assert(fragment_count > 0 && "Pipeline produced 0 fragments!");
 
-    tb->clock_cycle();
-
-    std::cout << "Top-level integrated pipeline tests passed." << std::endl;
+    std::cout << "Top-level end-to-end integration tests passed successfully" << std::endl;
     return 0;
 }

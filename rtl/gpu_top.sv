@@ -53,21 +53,23 @@ module gpu_top #(
     input wire m_axi_rvalid,
     output logic m_axi_rready,
 
-    // Transformed Output Stream (Screen Space Pixels)
-    output logic signed [31:0] stream_x_screen,
-    output logic signed [31:0] stream_y_screen,
-    output logic signed [31:0] stream_z_depth,
-    output logic [31:0]        stream_color,
-    output logic               stream_valid,
-    input wire                 stream_ready
+    // Rasterized Fragment Output Stream
+    output logic signed [15:0] frag_x,
+    output logic signed [15:0] frag_y,
+    output logic signed [31:0] frag_z,
+    output logic [31:0]        frag_color,
+    output logic               frag_valid,
+    input wire                 frag_ready
 );
 
     // Control registers from AXI-Lite
     logic start_pulse;
     logic [AXI_ADDR_WIDTH-1:0] vbuf_base_addr;
     logic [31:0] vertex_count;
+    /* verilator lint_off UNUSEDSIGNAL */
     logic busy;
     logic done_pulse;
+    /* verilator lint_on UNUSEDSIGNAL */
     logic signed [31:0] mvp_matrix [0:3][0:3];
 
     // Fetch -> Geom interconnect
@@ -76,9 +78,41 @@ module gpu_top #(
     logic fetch_valid, fetch_ready;
 
     // Geom -> Persp interconnect
-    logic signed [31:0] clip_x, clip_y, clip_z, clip_w;
-    logic [31:0] clip_color;
-    logic clip_valid, clip_ready;
+    /* verilator lint_off UNUSEDSIGNAL */
+    logic signed [31:0] clip_x /* verilator public */;
+    logic signed [31:0] clip_y /* verilator public */;
+    logic signed [31:0] clip_z /* verilator public */;
+    logic signed [31:0] clip_w /* verilator public */;
+
+    logic [31:0]        clip_color /* verilator public */;
+    logic               clip_valid /* verilator public */;
+    logic               clip_ready /* verilator public */;
+    /* verilator lint_on UNUSEDSIGNAL */
+
+
+    // Persp -> Prim Assembly interconnect
+    logic signed [31:0] screen_x, screen_y, screen_z;
+    logic [31:0] screen_color;
+    logic screen_valid, screen_ready;
+
+    // Prim Assembly -> Rasterizer interconnect
+    logic signed [31:0] tri_v0_x /* verilator public */;
+    logic signed [31:0] tri_v0_y /* verilator public */;
+    logic signed [31:0] tri_v0_z /* verilator public */;
+    
+    logic signed [31:0] tri_v1_x /* verilator public */;
+    logic signed [31:0] tri_v1_y /* verilator public */;
+    logic signed [31:0] tri_v1_z /* verilator public */;
+    
+    logic signed [31:0] tri_v2_x /* verilator public */;
+    logic signed [31:0] tri_v2_y /* verilator public */;
+    logic signed [31:0] tri_v2_z /* verilator public */;
+    
+    logic [31:0]        tri_color /* verilator public */;
+    
+    logic               tri_valid /* verilator public */;
+    logic               tri_ready /* verilator public */;
+
 
     // Unused AXI-Lite read channels
     assign s_axi_arready = 1'b0;
@@ -139,7 +173,7 @@ module gpu_top #(
         .stream_ready     (fetch_ready)
     );
 
-    // Geometry Engine (4x4 Matrix Multiply)
+    // Geometry Engine
     geom_engine #(
         .DATA_WIDTH (AXI_DATA_WIDTH),
         .FRAC_BITS  (FRAC_BITS)
@@ -178,12 +212,67 @@ module gpu_top #(
         .s_stream_color    (clip_color),
         .s_stream_valid    (clip_valid),
         .s_stream_ready    (clip_ready),
-        .m_stream_x_screen (stream_x_screen),
-        .m_stream_y_screen (stream_y_screen),
-        .m_stream_z_depth  (stream_z_depth),
-        .m_stream_color    (stream_color),
-        .m_stream_valid    (stream_valid),
-        .m_stream_ready    (stream_ready)
+        .m_stream_x_screen (screen_x),
+        .m_stream_y_screen (screen_y),
+        .m_stream_z_depth  (screen_z),
+        .m_stream_color    (screen_color),
+        .m_stream_valid    (screen_valid),
+        .m_stream_ready    (screen_ready)
+    );
+
+    // Primitive Assembly
+    prim_assembly #(
+        .DATA_WIDTH (AXI_DATA_WIDTH)
+    ) u_prim_assembly (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .s_v_x       (screen_x),
+        .s_v_y       (screen_y),
+        .s_v_z       (screen_z),
+        .s_v_color   (screen_color),
+        .s_v_valid   (screen_valid),
+        .s_v_ready   (screen_ready),
+        .m_v0_x      (tri_v0_x),
+        .m_v0_y      (tri_v0_y),
+        .m_v0_z      (tri_v0_z),
+        .m_v1_x      (tri_v1_x),
+        .m_v1_y      (tri_v1_y),
+        .m_v1_z      (tri_v1_z),
+        .m_v2_x      (tri_v2_x),
+        .m_v2_y      (tri_v2_y),
+        .m_v2_z      (tri_v2_z),
+        .m_color     (tri_color),
+        .m_tri_valid (tri_valid),
+        .m_tri_ready (tri_ready)
+    );
+
+    // Incremental Pineda Rasterizer
+    rasterizer #(
+        .DATA_WIDTH (AXI_DATA_WIDTH),
+        .FRAC_BITS  (FRAC_BITS),
+        .SCREEN_W   (SCREEN_W),
+        .SCREEN_H   (SCREEN_H)
+    ) u_rasterizer (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .s_v0_x      (tri_v0_x),
+        .s_v0_y      (tri_v0_y),
+        .s_v0_z      (tri_v0_z),
+        .s_v1_x      (tri_v1_x),
+        .s_v1_y      (tri_v1_y),
+        .s_v1_z      (tri_v1_z),
+        .s_v2_x      (tri_v2_x),
+        .s_v2_y      (tri_v2_y),
+        .s_v2_z      (tri_v2_z),
+        .s_color     (tri_color),
+        .s_tri_valid (tri_valid),
+        .s_tri_ready (tri_ready),
+        .frag_x      (frag_x),
+        .frag_y      (frag_y),
+        .frag_z      (frag_z),
+        .frag_color  (frag_color),
+        .frag_valid  (frag_valid),
+        .frag_ready  (frag_ready)
     );
 
 endmodule
