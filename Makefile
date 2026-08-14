@@ -4,9 +4,9 @@ RTL_DIR   = $(PROJ_ROOT)/rtl
 TB_DIR    = $(PROJ_ROOT)/tb
 BUILD_DIR = build
 
-.PHONY: all run_axi run_fetch run_geom run_top clean wave
+.PHONY: all run_axi run_fetch run_geom run_top run_pixel clean wave
 
-all: run_axi run_fetch run_geom run_top
+all: run_axi run_fetch run_geom run_top run_pixel
 
 run_axi:
 	mkdir -p $(BUILD_DIR)/axi
@@ -61,6 +61,15 @@ run_rast:
 		--top-module rasterizer -Mdir $(BUILD_DIR)/rast
 	make -C $(BUILD_DIR)/rast -f Vrasterizer.mk Vrasterizer
 	./$(BUILD_DIR)/rast/Vrasterizer
+
+run_pixel:
+	mkdir -p $(BUILD_DIR)/pixel
+	verilator -Wall --cc --trace --exe \
+		-I$(RTL_DIR) \
+		$(RTL_DIR)/pixel_map.sv $(TB_DIR)/pixel_map_tb.cpp \
+		--top-module pixel_map -Mdir $(BUILD_DIR)/pixel
+	make -C $(BUILD_DIR)/pixel -f Vpixel_map.mk Vpixel_map
+	./$(BUILD_DIR)/pixel/Vpixel_map
 
 run_top:
 	mkdir -p $(BUILD_DIR)/top

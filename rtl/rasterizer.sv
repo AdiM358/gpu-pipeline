@@ -65,7 +65,7 @@ module rasterizer #(
     assign s_tri_ready = (state == IDLE);
     assign frag_x      = curr_x;
     assign frag_y      = curr_y;
-    assign frag_z      = v0_z;
+    assign frag_z      = v0_z; // FIX ME
     assign frag_color  = color_reg;
 
     function automatic logic signed [15:0] to_int(input logic signed [DATA_WIDTH-1:0] val);

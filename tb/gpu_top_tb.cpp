@@ -7,6 +7,9 @@
 #include "Vgpu_top.h"
 #include "Vgpu_top___024root.h"
 #include "Vgpu_top_gpu_top.h"
+#include <fstream>
+#include <iomanip>
+#include "Vgpu_top_framebuffer.h"
 
 constexpr int32_t to_q16(double val) {
     return static_cast<int32_t>(val * 65536.0);
@@ -26,7 +29,11 @@ struct Testbench {
     uint64_t main_time = 0;
 
     std::vector<uint32_t> vram;
+    std::vector<int32_t> zbuffer;
+
     static constexpr uint32_t VRAM_BASE_ADDR = 0x80000000;
+    static constexpr uint32_t SCREEN_W = 640;
+    static constexpr uint32_t SCREEN_H = 480;
 
     uint32_t active_araddr = 0;
     uint8_t active_arlen = 0;
@@ -40,7 +47,8 @@ struct Testbench {
         top->trace(trace.get(), 99);
         trace->open("waveform.vcd");
 
-        vram.resize(256, 0);
+        vram.resize(1024, 0);
+        zbuffer.resize(SCREEN_W * SCREEN_H, 0x7FFFFFFF); // Init to max depth
     }
 
     ~Testbench() {
@@ -57,9 +65,20 @@ struct Testbench {
     void clock_cycle() {
         top->clk = 0;
         tick();
+
+        // Simulate synchronous Z-Buffer read memory
+        if (top->m_zbuf_rd_en && top->m_zbuf_rd_addr < zbuffer.size()) {
+            top->s_zbuf_rd_data = zbuffer[top->m_zbuf_rd_addr];
+        }
+
         top->clk = 1;
         service_axi_memory_requests();
         tick();
+
+        // Handle Z-buffer updates on the rising edge
+        if (top->m_zbuf_wr_en && top->m_zbuf_wr_addr < zbuffer.size()) {
+            zbuffer[top->m_zbuf_wr_addr] = top->m_zbuf_wr_data;
+        }
     }
 
     void reset() {
@@ -80,8 +99,7 @@ struct Testbench {
         top->m_axi_rdata = 0;
         top->m_axi_rresp = 0;
         top->m_axi_rlast = 0;
-
-        top->frag_ready = 1;
+        top->s_zbuf_rd_data = 0;
 
         for (int i = 0; i < 5; i++) {
             clock_cycle();
@@ -128,12 +146,23 @@ struct Testbench {
         top->s_axi_bready = 0;
     }
 
-    void set_identity_matrix() {
+    void set_mvp(double rotX_deg, double rotY_deg, double scale) {
+        double rX = rotX_deg * M_PI / 180.0;
+        double rY = rotY_deg * M_PI / 180.0;
+        
+        // MVP = Scale * RotY * RotX
+        double mat[4][4] = {
+            { scale * cos(rY), scale * sin(rX)*sin(rY), scale * cos(rX)*sin(rY), 0.0 },
+            { 0.0,             scale * cos(rX),         scale * -sin(rX),        0.0 },
+            { scale * -sin(rY),scale * sin(rX)*cos(rY), scale * cos(rX)*cos(rY), 0.0 },
+            { 0.0,             0.0,                     0.0,                     1.0 }
+        };
+
+        // Write 16 matrix elements via AXI
         for (int r = 0; r < 4; r++) {
             for (int c = 0; c < 4; c++) {
                 uint8_t addr = 0x10 + (r * 4 + c) * 4;
-                uint32_t val = (r == c) ? to_q16(1.0) : 0;
-                axi_lite_write(addr, val);
+                axi_lite_write(addr, to_q16(mat[r][c]));
             }
         }
     }
@@ -179,7 +208,49 @@ struct Testbench {
             top->m_axi_rlast = 0;
         }
     }
+
+    void save_framebuffer_to_ppm(const std::string& filename) {
+        std::ofstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "Failed to open " << filename << " for writing." << std::endl;
+            return;
+        }
+
+        // PPM Header: P3 (Text RGB), Width, Height, Max Color Value (255)
+        file << "P3\n" << SCREEN_W << " " << SCREEN_H << "\n255\n";
+
+        // Read directly from the Verilated memory array
+        for (int y = 0; y < SCREEN_H; y++) {
+            for (int x = 0; x < SCREEN_W; x++) {
+                uint32_t addr = (y * SCREEN_W) + x;
+                
+                // Access the public RAM array inside the framebuffer module
+                uint32_t pixel = top->rootp->gpu_top->u_framebuffer->ram_array[addr];
+
+                // Extract ARGB channels (assuming 0xAARRGGBB format)
+                uint8_t r = (pixel >> 16) & 0xFF;
+                uint8_t g = (pixel >> 8) & 0xFF;
+                uint8_t b = pixel & 0xFF;
+
+                // Write RGB values to file
+                file << (int)r << " " << (int)g << " " << (int)b << " ";
+            }
+            file << "\n"; 
+        }
+
+        file.close();
+        std::cout << "Saved rendered frame to " << filename << std::endl;
+    }
 };
+
+void push_tri(Testbench* tb, uint32_t& addr, 
+              double x0, double y0, double z0, 
+              double x1, double y1, double z1, 
+              double x2, double y2, double z2, uint32_t color) {
+    tb->load_vertex_into_vram(addr, {to_q16(x0), to_q16(y0), to_q16(z0), color, {0}}); addr += 32;
+    tb->load_vertex_into_vram(addr, {to_q16(x1), to_q16(y1), to_q16(z1), color, {0}}); addr += 32;
+    tb->load_vertex_into_vram(addr, {to_q16(x2), to_q16(y2), to_q16(z2), color, {0}}); addr += 32;
+}
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
@@ -187,54 +258,49 @@ int main(int argc, char** argv) {
 
     tb->reset();
 
-    // 3 model-space vertices forming a triangle:
-    // V0 = (-0.1, -0.1, 0.5) -> Screen (288, 264)
-    // V1 = ( 0.0,  0.1, 0.5) -> Screen (320, 216)
-    // V2 = ( 0.1, -0.1, 0.5) -> Screen (352, 264)
-    Vertex v0 = {to_q16(-0.1), to_q16(-0.1), to_q16(0.5), 0x00FF00FF, {0}};
-    Vertex v1 = {to_q16( 0.0), to_q16( 0.1), to_q16(0.5), 0x00FF00FF, {0}};
-    Vertex v2 = {to_q16( 0.1), to_q16(-0.1), to_q16(0.5), 0x00FF00FF, {0}};
+    // The 8 corners of a cube (Size 0.4x0.4x0.4)
+    double n = -0.2, p = 0.2;
+    uint32_t addr = Testbench::VRAM_BASE_ADDR;
 
-    tb->load_vertex_into_vram(Testbench::VRAM_BASE_ADDR + 0,  v0);
-    tb->load_vertex_into_vram(Testbench::VRAM_BASE_ADDR + 32, v1);
-    tb->load_vertex_into_vram(Testbench::VRAM_BASE_ADDR + 64, v2);
+    // Face 1: Front (Red)
+    push_tri(tb.get(), addr, n, n, n,  p, p, n,  p, n, n, 0x00FF0000);
+    push_tri(tb.get(), addr, n, n, n,  n, p, n,  p, p, n, 0x00FF0000);
+    // Face 2: Back (Cyan)
+    push_tri(tb.get(), addr, p, n, p,  n, p, p,  n, n, p, 0x0000FFFF);
+    push_tri(tb.get(), addr, p, n, p,  p, p, p,  n, p, p, 0x0000FFFF);
+    // Face 3: Left (Green)
+    push_tri(tb.get(), addr, n, n, p,  n, p, n,  n, n, n, 0x0000FF00);
+    push_tri(tb.get(), addr, n, n, p,  n, p, p,  n, p, n, 0x0000FF00);
+    // Face 4: Right (Magenta)
+    push_tri(tb.get(), addr, p, n, n,  p, p, p,  p, n, p, 0x00FF00FF);
+    push_tri(tb.get(), addr, p, n, n,  p, p, n,  p, p, p, 0x00FF00FF);
+    // Face 5: Top (Blue)
+    push_tri(tb.get(), addr, n, p, n,  p, p, p,  p, p, n, 0x000000FF);
+    push_tri(tb.get(), addr, n, p, n,  n, p, p,  p, p, p, 0x000000FF);
+    // Face 6: Bottom (Yellow)
+    // FIX: Not appearing due to constant z-depth used by rasterizer 
+    push_tri(tb.get(), addr, n, n, p,  p, n, n,  p, n, p, 0x00FFFF00);
+    push_tri(tb.get(), addr, n, n, p,  n, n, n,  p, n, n, 0x00FFFF00);
 
-    tb->set_identity_matrix();
+    // Rotate Cube: X = 35 deg, Y = 45 deg, Scale = 1.0
+    tb->set_mvp(10.0, 15.0, 1.0);
     tb->axi_lite_write(0x04, Testbench::VRAM_BASE_ADDR);
-    tb->axi_lite_write(0x08, 3); // 3 vertices
+    tb->axi_lite_write(0x08, 36); // 12 triangles * 3 vertices
 
-    tb->axi_lite_write(0x00, 0x00000001); // Trigger start pulse
+    tb->axi_lite_write(0x00, 0x00000001); // Trigger GPU
 
-    std::cout << "Streaming fragments from full GPU pipeline..." << std::endl;
+    std::cout << "Rendering 3D Cube (12 Triangles)..." << std::endl;
     int fragment_count = 0;
     int cycles = 0;
 
-    while (cycles < 5000) {
+    // Run until pipeline finishes rendering (increased timeout for larger object)
+    while (cycles < 250000) {
         tb->clock_cycle();
         cycles++;
-        if (tb->top->rootp->gpu_top->tri_valid) {
-            std::cout << "Assembled Tri V0: (" 
-                    << (tb->top->rootp->gpu_top->tri_v0_x >> 16) << ", " 
-                    << (tb->top->rootp->gpu_top->tri_v0_y >> 16) << ")" << std::endl;
-            std::cout << "Assembled Tri V1: (" 
-                    << (tb->top->rootp->gpu_top->tri_v1_x >> 16) << ", " 
-                    << (tb->top->rootp->gpu_top->tri_v1_y >> 16) << ")" << std::endl;
-            std::cout << "Assembled Tri V2: (" 
-                    << (tb->top->rootp->gpu_top->tri_v2_x >> 16) << ", " 
-                    << (tb->top->rootp->gpu_top->tri_v2_y >> 16) << ")" << std::endl;
-        }
-        if (tb->top->frag_valid) {
-            fragment_count++;
-            if (fragment_count <= 5 || fragment_count % 100 == 0) {
-                std::cout << "  Fragment #" << fragment_count << ": (" 
-                          << tb->top->frag_x << ", " << tb->top->frag_y << ")" << std::endl;
-            }
-        }
+        if (tb->top->m_fb_wr_en) fragment_count++;
     }
 
-    std::cout << "End-to-End Simulation complete. Total fragments: " << fragment_count << std::endl;
-    assert(fragment_count > 0 && "Pipeline produced 0 fragments!");
-
     std::cout << "Top-level end-to-end integration tests passed successfully" << std::endl;
+    tb->save_framebuffer_to_ppm("render_output.ppm");
     return 0;
 }

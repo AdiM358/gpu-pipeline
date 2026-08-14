@@ -53,13 +53,20 @@ module gpu_top #(
     input wire m_axi_rvalid,
     output logic m_axi_rready,
 
-    // Rasterized Fragment Output Stream
-    output logic signed [15:0] frag_x,
-    output logic signed [15:0] frag_y,
-    output logic signed [31:0] frag_z,
-    output logic [31:0]        frag_color,
-    output logic               frag_valid,
-    input wire                 frag_ready
+    // Memory Interface: Z-Buffer (Read)
+    output logic [31:0]      m_zbuf_rd_addr,
+    output logic             m_zbuf_rd_en,
+    input wire [31:0]        s_zbuf_rd_data,
+
+    // Memory Interface: Z-Buffer (Write)
+    output logic [31:0]      m_zbuf_wr_addr,
+    output logic signed [31:0] m_zbuf_wr_data,
+    output logic             m_zbuf_wr_en,
+
+    // Memory Interface: Framebuffer (Write)
+    output logic [31:0]      m_fb_wr_addr,
+    output logic [31:0]      m_fb_wr_data,
+    output logic             m_fb_wr_en
 );
 
     // Control registers from AXI-Lite
@@ -113,6 +120,11 @@ module gpu_top #(
     logic               tri_valid /* verilator public */;
     logic               tri_ready /* verilator public */;
 
+    // Rasterizer -> Pixel Map interconnect
+    logic signed [15:0] frag_x, frag_y;
+    logic signed [31:0] frag_z;
+    logic [31:0]        frag_color;
+    logic               frag_valid, frag_ready;
 
     // Unused AXI-Lite read channels
     assign s_axi_arready = 1'b0;
@@ -273,6 +285,46 @@ module gpu_top #(
         .frag_color  (frag_color),
         .frag_valid  (frag_valid),
         .frag_ready  (frag_ready)
+    );
+
+    // Pixel Map (Z-Buffer Depth Test & Memory Address Gen)
+    pixel_map #(
+        .SCREEN_W (SCREEN_W),
+        .SCREEN_H (SCREEN_H)
+    ) u_pixel_map (
+        .clk            (clk),
+        .rst_n          (rst_n),
+        .s_frag_x       (frag_x),
+        .s_frag_y       (frag_y),
+        .s_frag_z       (frag_z),
+        .s_frag_color   (frag_color),
+        .s_frag_valid   (frag_valid),
+        .s_frag_ready   (frag_ready),
+        .m_zbuf_rd_addr (m_zbuf_rd_addr),
+        .m_zbuf_rd_en   (m_zbuf_rd_en),
+        .s_zbuf_rd_data (s_zbuf_rd_data),
+        .m_zbuf_wr_addr (m_zbuf_wr_addr),
+        .m_zbuf_wr_data (m_zbuf_wr_data),
+        .m_zbuf_wr_en   (m_zbuf_wr_en),
+        .m_fb_wr_addr   (m_fb_wr_addr),
+        .m_fb_wr_data   (m_fb_wr_data),
+        .m_fb_wr_en     (m_fb_wr_en)
+    );
+
+    // Dual-Port BRAM Framebuffer
+    framebuffer #(
+        .SCREEN_W (SCREEN_W),
+        .SCREEN_H (SCREEN_H),
+        .DATA_WIDTH (32)
+    ) u_framebuffer (
+        .clk       (clk),
+        .s_wr_addr (m_fb_wr_addr),
+        .s_wr_data (m_fb_wr_data),
+        .s_wr_en   (m_fb_wr_en),
+        .s_rd_addr (32'b0), // Unused until VGA controller is added
+        /* verilator lint_off PINCONNECTEMPTY */
+        .m_rd_data () // Not connected until VGA controller is added
+        /* verilator lint_on PINCONNECTEMPTY */
     );
 
 endmodule
