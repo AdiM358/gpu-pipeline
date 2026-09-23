@@ -1,173 +1,159 @@
-#include <iostream>
-#include "sim.h"
-#include <memory>
-#include <vector>
-#include <verilated.h>
-#include <verilated_vcd_c.h>
+// geom_engine: bit-exact against model::transform under random stimulus and
+// back-pressure; throughput of one vertex per 4 cycles; idle signalling.
+#include <deque>
+
 #include "Vgeom_engine.h"
+#include "gpu_model.h"
+#include "sim.h"
 
-// Q16.16 conversion helpers
-constexpr int32_t to_q16(double val) {
-    return static_cast<int32_t>(val * 65536.0);
-}
+using Dut = Vgeom_engine;
 
-constexpr double from_q16(int32_t val) {
-    return static_cast<double>(val) / 65536.0;
-}
+namespace {
 
-struct Testbench {
-    std::unique_ptr<Vgeom_engine> top;
-    std::unique_ptr<VerilatedVcdC> trace;
-    uint64_t main_time = 0;
+struct Stream : tb::Agent {
+    tb::Sim<Dut>& sim;
+    Dut& d;
+    const int32_t* mvp;
+    std::deque<model::ClipVtx> expected;
+    std::vector<model::Vertex> to_send;
+    size_t sent = 0;
+    uint64_t received = 0;
+    int valid_pct = 100, ready_pct = 100;
+    Stream(tb::Sim<Dut>& s, const int32_t* m) : sim(s), d(*s.dut), mvp(m) {}
 
-    Testbench() {
-        top = std::make_unique<Vgeom_engine>();
-#if VM_TRACE
-        Verilated::traceEverOn(true);
-        trace = std::make_unique<VerilatedVcdC>();
-        top->trace(trace.get(), 99);
-        trace->open("waveform.vcd");
-#endif
-    }
-
-    ~Testbench() {
-#if VM_TRACE
-        if (trace) trace->close();
-#endif
-    }
-
-    void tick() {
-        top->clk = !top->clk;
-        top->eval();
-#if VM_TRACE
-        if (trace) trace->dump(main_time);
-#endif
-        main_time++;
-    }
-
-    void clock_cycle() {
-        top->clk = 0;
-        tick();
-        top->clk = 1;
-        tick();
-    }
-
-    void reset() {
-        top->rst_n = 0;
-        top->s_stream_vx = 0;
-        top->s_stream_vy = 0;
-        top->s_stream_vz = 0;
-        top->s_stream_color = 0;
-        top->s_stream_valid = 0;
-        top->m_stream_ready = 1;
-
-        // Initialize 4x4 matrix to zero
-        for (int r = 0; r < 4; r++) {
-            for (int c = 0; c < 4; c++) {
-                top->mvp_matrix[r][c] = 0;
-            }
-        }
-
-        for (int i = 0; i < 5; i++) {
-            clock_cycle();
-        }
-        top->rst_n = 1;
-        clock_cycle();
-        std::cout << "Reset complete." << std::endl;
-    }
-
-    void set_matrix_identity() {
-        for (int r = 0; r < 4; r++) {
-            for (int c = 0; c < 4; c++) {
-                top->mvp_matrix[r][c] = (r == c) ? to_q16(1.0) : 0;
-            }
+    void present() {
+        d.in_valid = sent < to_send.size() && sim.chance(valid_pct);
+        if (sent < to_send.size()) {
+            const auto& v = to_send[sent];
+            d.in_x = v.x;
+            d.in_y = v.y;
+            d.in_z = v.z;
+            d.in_color = v.color & 0xFFFFFF;  // 24-bit port: Verilator does not mask inputs
         }
     }
+    void observe() override {
+        last_hs_ = d.in_valid && d.in_ready;
+        if (!d.rst_n) return;
+        if (d.in_valid && d.in_ready) {
+            const auto& v = to_send[sent++];
+            expected.push_back(model::transform(mvp, v.x, v.y, v.z, v.color & 0xFFFFFF));
+        }
+        if (d.out_valid && d.out_ready) {
+            if (expected.empty()) FATAL("unexpected output vertex");
+            const model::ClipVtx got{d.out_x, d.out_y, d.out_z, d.out_w, d.out_color};
+            const model::ClipVtx& e = expected.front();
+            CHECK_MSG(got == e, "vertex %llu: got (%08x %08x %08x %08x) expected (%08x %08x %08x %08x)",
+                      (unsigned long long)received, got.x, got.y, got.z, got.w, e.x, e.y, e.z, e.w);
+            CHECK_EQ(got.color, e.color);
+            expected.pop_front();
+            ++received;
+        }
+    }
+    void drive() override {
+        // Hold VALID and data stable until the handshake (stream protocol).
+        const bool holding = d.in_valid && !last_hs_;
+        if (!holding) present();
+        d.out_ready = sim.chance(ready_pct);
+    }
+    bool last_hs_ = false;
 };
 
+int32_t rand_q16(tb::Sim<Dut>& sim, int range_bits) {
+    // Random value with magnitude < 2^range_bits (Q16.16).
+    const int64_t r = static_cast<int64_t>(sim.rand_u32() & ((1ull << range_bits) - 1));
+    return static_cast<int32_t>(sim.chance(50) ? r : -r);
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
-    auto tb = std::make_unique<Testbench>();
+    tb::Sim<Dut> sim(argc, argv, "geom_engine");
+    Dut& d = *sim.dut;
+    int32_t mvp[16] = {};
+    Stream st(sim, mvp);
+    sim.add_agent(&st);
+    auto load_mvp = [&]() {
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) d.mvp[r][c] = mvp[4 * r + c];
+    };
 
-    tb->reset();
+    d.in_valid = 0;
+    d.out_ready = 1;
+    load_mvp();
+    sim.reset();
+    CHECK_EQ(d.idle, 1);
 
-    // 1. Load Identity Matrix into Engine
-    tb->set_matrix_identity();
+    auto run = [&](size_t n) {
+        const uint64_t t0 = sim.cycle;
+        while (st.received < n) {
+            sim.tick();
+            if (sim.cycle - t0 > 100 * n + 100) FATAL("stream stalled");
+        }
+        return sim.cycle - t0;
+    };
 
-    // 2. Drive Vertex Input (X=1.0, Y=2.0, Z=3.0, Color=0xFF0000FF)
-    tb->top->s_stream_vx = to_q16(1.0);
-    tb->top->s_stream_vy = to_q16(2.0);
-    tb->top->s_stream_vz = to_q16(3.0);
-    tb->top->s_stream_color = 0xFF0000FF;
-    tb->top->s_stream_valid = 1;
-    tb->top->m_stream_ready = 1;
+    // ---- identity, then a scale+translate: exact expected values
+    for (int i = 0; i < 4; ++i) mvp[5 * i] = 0x10000;
+    load_mvp();
+    st.to_send = {{0x10000, 0x20000, 0x30000, 0xFF0000}};
+    run(1);
+    mvp[0] = mvp[5] = mvp[10] = 0x20000;
+    mvp[3] = 0x50000;  // translate x by 5
+    load_mvp();
+    st.to_send.push_back({-0x10000, 0x8000, 0, 0x00FF00});
+    st.received = 0;
+    const model::ClipVtx e = model::transform(mvp, -0x10000, 0x8000, 0, 0);
+    CHECK_EQ(e.x, 0x30000);  // (-1 * 2) + 5 = 3
+    CHECK_EQ(e.y, 0x10000);
+    CHECK_EQ(e.w, 0x10000);
+    run(1);
 
-    tb->clock_cycle();
-    tb->top->s_stream_valid = 0; // Clear valid after 1 cycle
+    // ---- throughput: back-to-back vertices, no back-pressure
+    st.to_send.clear();
+    st.sent = 0;
+    st.received = 0;
+    for (int i = 0; i < 400; ++i)
+        st.to_send.push_back({rand_q16(sim, 20), rand_q16(sim, 20), rand_q16(sim, 20), sim.rand_u32()});
+    const uint64_t t = run(400);
+    std::printf("  400 vertices back-to-back: %llu cycles (%.2f cycles/vertex)\n",
+                (unsigned long long)t, t / 400.0);
+    CHECK_MSG(t <= 4 * 400 + 10, "throughput below 1 vertex / 4 cycles (%llu cycles)",
+              (unsigned long long)t);
 
-    // 3. Wait through 2 pipeline stages for valid output
-    int timeout = 0;
-    while (!tb->top->m_stream_valid) {
-        tb->clock_cycle();
-        timeout++;
-        if (!(timeout < 20)) FATAL("Timeout waiting for m_stream_valid");
+    // ---- random matrices (including overflow-sized entries), random handshakes
+    for (int round = 0; round < 40; ++round) {
+        const int mbits = sim.chance(20) ? 31 : sim.rand_range(12, 20);
+        for (int i = 0; i < 16; ++i) mvp[i] = rand_q16(sim, mbits);
+        load_mvp();
+        st.valid_pct = sim.rand_range(20, 100);
+        st.ready_pct = sim.rand_range(20, 100);
+        st.to_send.clear();
+        st.sent = 0;
+        st.received = 0;
+        const int vbits = sim.chance(20) ? 31 : sim.rand_range(14, 22);
+        for (int i = 0; i < 100; ++i)
+            st.to_send.push_back({rand_q16(sim, vbits), rand_q16(sim, vbits), rand_q16(sim, vbits),
+                                  sim.rand_u32()});
+        run(100);
+        CHECK(st.expected.empty());
     }
 
-    std::cout << "Identity Matrix Test Output:" << std::endl;
-    std::cout << "  X_clip: " << from_q16(tb->top->m_stream_x_clip) << " (Expected: 1.0)" << std::endl;
-    std::cout << "  Y_clip: " << from_q16(tb->top->m_stream_y_clip) << " (Expected: 2.0)" << std::endl;
-    std::cout << "  Z_clip: " << from_q16(tb->top->m_stream_z_clip) << " (Expected: 3.0)" << std::endl;
-    std::cout << "  W_clip: " << from_q16(tb->top->m_stream_w_clip) << " (Expected: 1.0)" << std::endl;
+    // ---- idle only once everything has drained
+    st.valid_pct = st.ready_pct = 100;
+    st.to_send.clear();
+    st.sent = 0;
+    st.received = 0;
+    for (int i = 0; i < 3; ++i) st.to_send.push_back({i, i, i, 0});
+    int busy_cycles = 0;
+    bool was_busy = false;
+    do {
+        sim.tick();
+        was_busy |= !d.idle;
+        CHECK_MSG(!d.idle || st.expected.empty(), "idle asserted with a vertex in flight");
+        if (++busy_cycles > 100) FATAL("never idle");
+    } while (!(d.idle && st.received == 3));
+    CHECK(was_busy);
+    CHECK(st.expected.empty());
 
-    CHECK_MSG(tb->top->m_stream_x_clip == to_q16(1.0), "X clip mismatch");
-    CHECK_MSG(tb->top->m_stream_y_clip == to_q16(2.0), "Y clip mismatch");
-    CHECK_MSG(tb->top->m_stream_z_clip == to_q16(3.0), "Z clip mismatch");
-    CHECK_MSG(tb->top->m_stream_w_clip == to_q16(1.0), "W clip mismatch");
-    CHECK_MSG(tb->top->m_stream_color == 0xFF0000FF, "Color mismatch");
-
-
-    tb->clock_cycle();
-
-    // 4. Test 2: Scale Matrix by 2x and Translate X by +5.0
-    // [ 2  0  0  5 ]
-    // [ 0  2  0  0 ]
-    // [ 0  0  2  0 ]
-    // [ 0  0  0  1 ]
-    tb->set_matrix_identity();
-    tb->top->mvp_matrix[0][0] = to_q16(2.0);
-    tb->top->mvp_matrix[1][1] = to_q16(2.0);
-    tb->top->mvp_matrix[2][2] = to_q16(2.0);
-    tb->top->mvp_matrix[0][3] = to_q16(5.0); // Translate X
-
-    // Input Vertex (X=-1.0, Y=0.5, Z=0.0)
-    // Expected: X = (-1 * 2) + 5 = 3.0, Y = (0.5 * 2) = 1.0, Z = 0.0, W = 1.0
-    tb->top->s_stream_vx = to_q16(-1.0);
-    tb->top->s_stream_vy = to_q16(0.5);
-    tb->top->s_stream_vz = to_q16(0.0);
-    tb->top->s_stream_color = 0x00FF00FF;
-    tb->top->s_stream_valid = 1;
-
-    tb->clock_cycle();
-    tb->top->s_stream_valid = 0;
-
-    timeout = 0;
-    while (!tb->top->m_stream_valid) {
-        tb->clock_cycle();
-        timeout++;
-        if (!(timeout < 20)) FATAL("Timeout waiting for m_stream_valid");
-    }
-
-    std::cout << "Scale/Translate Matrix Test Output:" << std::endl;
-    std::cout << "  X_clip: " << from_q16(tb->top->m_stream_x_clip) << " (Expected: 3.0)" << std::endl;
-    std::cout << "  Y_clip: " << from_q16(tb->top->m_stream_y_clip) << " (Expected: 1.0)" << std::endl;
-    std::cout << "  Z_clip: " << from_q16(tb->top->m_stream_z_clip) << " (Expected: 0.0)" << std::endl;
-    std::cout << "  W_clip: " << from_q16(tb->top->m_stream_w_clip) << " (Expected: 1.0)" << std::endl;
-
-    CHECK_MSG(tb->top->m_stream_x_clip == to_q16(3.0), "Scale/Trans X mismatch");
-    CHECK_MSG(tb->top->m_stream_y_clip == to_q16(1.0), "Scale/Trans Y mismatch");
-    CHECK_MSG(tb->top->m_stream_z_clip == to_q16(0.0), "Scale/Trans Z mismatch");
-    CHECK_MSG(tb->top->m_stream_w_clip == to_q16(1.0), "Scale/Trans W mismatch");
-
-
-    return tb::summarize("geom_engine", tb->main_time / 2, 1);
+    return sim.finish();
 }

@@ -53,7 +53,7 @@ struct ErrMon : tb::Agent {
 };
 
 Vtx vertex_at(tb::AxiMem<Dut>& mem, uint32_t addr) {
-    return {mem.read32(addr), mem.read32(addr + 4), mem.read32(addr + 8), mem.read32(addr + 12)};
+    return {mem.read32(addr), mem.read32(addr + 4), mem.read32(addr + 8), mem.read32(addr + 12) & 0xFFFFFF};
 }
 
 // Starts a job and runs until busy falls. Returns cycles taken.

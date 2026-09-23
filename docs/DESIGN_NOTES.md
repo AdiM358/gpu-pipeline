@@ -129,3 +129,73 @@ run a clean job.
 jobs (random length, alignment, AR/R timing, read latency, output
 back-pressure), plus directed boundary, error, and throughput tests.
 It passes on 11 seeds.
+
+---
+
+## Phase 4: Golden model, geometry, perspective divide
+
+**Decision: write the bit-accurate C++ model first and treat it as the spec.**
+`model/gpu_model.{h,cpp}` defines every format, rounding step and
+wrap-around. Unit tests compare each stage bit-exactly, and the system test
+(phase 6) compares whole frames pixel by pixel. The model evaluates each
+pixel directly from plane equations, while the RTL steps incrementally with
+spans and pipelines. Because the two formulations differ, agreement tests the
+RTL's incremental and traversal logic rather than a transcription of it.
+
+**Decision: 4 multipliers over 4 cycles, not 16 in one (geom_engine).**
+Phase 3 fixed the input rate at one vertex per 4 cycles, the 32-bit bus limit,
+so a fully parallel 4x4 transform would sit idle 75% of the time. Computing
+one output row per cycle is the same throughput with a quarter of the
+multipliers: about 16 DSP48 instead of about 64 for 32x32 products. The DSP
+counts come from Vivado's usual 4-DSP decomposition of a 32x32 multiply, and
+the real numbers are in the Vivado report. Measured throughput: 400 vertices
+in 1607 cycles (4.02 cycles/vertex). The pipeline is operand select, then
+multiply, then a product register (so synthesis can pack the DSP's M and P
+registers), then pairwise sums, then the final sum. The old design did the
+4-input 64-bit add in one stage.
+
+*Only 48 product bits are kept.* The result is bits [47:16] of the sum, and a
+sum's low 48 bits depend only on the operands' low 48 bits, so the upper 16
+bits of every product can be dropped without changing the answer. The
+model computes the same thing with 64-bit wrap-around, and the test includes
+full-range matrices where the wrap actually happens.
+
+**Decision: one reciprocal and three multiplies instead of three dividers.**
+The old code had three combinational 64-bit dividers in one cycle, which is
+hundreds of logic levels. Now `recip_pipe` computes floor(2^44 / w) once per
+vertex, and x, y, z are multiplied by it.
+
+**Decision: a pipelined divider (32 stages, 1 per cycle), not an iterative one.**
+An iterative divider is about 100 flops against about 3000, but it would
+cap geometry at 1 vertex per 32 cycles, 8x slower than fetch. In the setup unit
+(phase 5) the same trade-off goes the other way. Rate-matching decides both.
+The divider's payload (x, y, z, colour, flags) rides in a reset-free shift
+register with one output tap, which maps to SRL32 LUTs rather than 127x32
+flops. Measured: 500 vertices in 537 cycles, a 36-cycle latency followed by
+1 per cycle.
+
+**Decision: numeric formats sized to need.**
+
+| Quantity | Format | Why |
+|---|---|---|
+| model/clip coordinates | Q16.16, 32-bit | inherited; register-programmable matrix |
+| reciprocal | floor(2^44/w), 32-bit unsigned | w > 1/16 bounds it below 2^32 |
+| NDC | Q.20 | 20 fraction bits is < 1/16 px error even at 1023 px |
+| screen x/y | Q11.4, 16-bit signed | 4 sub-pixel bits (standard); ±1024 px guard band |
+| depth | 16-bit unsigned | half the BRAM of 32-bit; see phase 6 |
+| colour | RGB888 per vertex | bits 31:24 of the colour word are not stored |
+
+**Decision: the near plane is w > 1/16, and near triangles are dropped, not
+clipped.** `w <= 1/16` flags a vertex NEAR and substitutes a harmless divisor.
+The triangle is then dropped in setup and counted in `PERF_TRI_CLIPPED`, not
+drawn as garbage (baseline bug B7). Outcodes for all six clip planes are
+computed here in clip space, where they are exact, with a 33-bit compare so
+that `-w` cannot overflow for `w = INT32_MIN`. The test hits
+`w = 1/16 - 1ulp, 1/16, 1/16 + 1ulp, 0, -1, INT32_MIN, INT32_MAX`, points
+exactly on and one ulp outside the frustum planes, and both sides of the
+guard band. It requires every flag bit to have been produced and checked at
+least once.
+
+**Testbench gotcha:** Verilator does not mask input ports narrower than the C
+type. A random 32-bit colour driven into a 24-bit port kept its top byte all
+the way to the output. Testbenches now mask inputs to port width.

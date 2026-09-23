@@ -3,7 +3,7 @@
 // Vertex fetch: AXI4 burst reader with credit-based prefetch.
 //
 // Vertex format (16 bytes, little-endian words): x, y, z (Q16.16), color
-// (0x00RRGGBB). Every fetched byte is used.
+// (0x00RRGGBB; bits 31:24 are ignored and not stored).
 //
 // Read requests are issued ahead of consumption: a burst of up to
 // BURST_VERTS vertices is issued whenever the vertex FIFO has room for it
@@ -48,7 +48,7 @@ module vertex_fetch #(
     output logic signed [31:0] out_x,
     output logic signed [31:0] out_y,
     output logic signed [31:0] out_z,
-    output logic [31:0]        out_color,
+    output logic [23:0]        out_color,
     output logic               out_valid,
     input  wire                out_ready
 );
@@ -70,7 +70,7 @@ module vertex_fetch #(
     logic [BW-1:0] bursts_out;     // bursts requested, not yet complete
 
     // ------------------------------------------------------------ vertex FIFO
-    logic [127:0]  fifo_mem [FIFO_VERTS];
+    logic [119:0]  fifo_mem [FIFO_VERTS];
     logic [PW-1:0] wr_ptr, rd_ptr;
     logic [CW-1:0] fifo_count;
 
@@ -206,7 +206,7 @@ module vertex_fetch #(
                 default: ;
             endcase
         end
-        if (push) fifo_mem[wr_ptr] <= {m_axi_rdata, asm_words};
+        if (push) fifo_mem[wr_ptr] <= {m_axi_rdata[23:0], asm_words};
         if (pop)  {out_color, out_z, out_y, out_x} <= fifo_mem[rd_ptr];
     end
 
