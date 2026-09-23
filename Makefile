@@ -71,6 +71,41 @@ endef
 
 $(foreach t,$(TESTS),$(eval $(call TEST_RULES,$(t))))
 
+# ---------------------------------------------------------------- demo
+# Renders FRAMES frames of the animated scene (each checked against the
+# model), writes out/demo/frame_NNN.ppm and docs/img/demo.gif.
+FRAMES ?= 48
+top_demo  := gpu_top
+args_demo  = +frames=$(FRAMES) +out=$(abspath out/demo)
+$(eval $(call TEST_RULES,demo))
+
+.PHONY: demo perf
+demo:
+	@mkdir -p out/demo docs/img
+	$(MAKE) --no-print-directory test-demo
+	python3 scripts/make_gif.py out/demo docs/img/demo.gif
+
+# ---------------------------------------------------------------- perf
+# The same benchmark scenes at each rasterizer span width -> out/perf.md
+PERF_SPANS := 1 2 4 8
+define PERF_RULES
+top_perf_s$(1)    := gpu_top
+src_perf_s$(1)    := tb/perf_tb.cpp
+vflags_perf_s$(1) := -GRAST_SPAN=$(1)
+args_perf_s$(1)   := +span=$(1)
+$$(eval $$(call TEST_RULES,perf_s$(1)))
+endef
+$(foreach s,$(PERF_SPANS),$(eval $(call PERF_RULES,$(s))))
+
+perf: $(addprefix $(BUILD_DIR)/perf_s,$(addsuffix /Vgpu_top,$(PERF_SPANS)))
+	@mkdir -p out
+	@for s in $(PERF_SPANS); do \
+	   $(MAKE) --no-print-directory test-perf_s$$s > out/perf_s$$s.log 2>&1 || { cat out/perf_s$$s.log; exit 1; }; \
+	 done
+	@{ echo "| RAST_SPAN | scene | triangles | rasterized | fragments | draw cycles | fragments/cycle | rasterizer busy cycles |"; \
+	   echo "|---:|---|---:|---:|---:|---:|---:|---:|"; \
+	   grep -h '^| ' $(foreach s,$(PERF_SPANS),out/perf_s$(s).log); } | tee out/perf.md
+
 # Line coverage over the whole regression. Each test writes coverage.dat;
 # they are merged and summarised per RTL file (one module per file).
 COV_DIR := $(BUILD_DIR)/cov
@@ -80,6 +115,24 @@ coverage:
 	rm -rf $(COV_DIR)/annotated
 	verilator_coverage --annotate $(COV_DIR)/annotated --annotate-min 1 $(COV_DIR)/merged.dat
 	python3 scripts/coverage_report.py $(COV_DIR)/merged.dat | tee $(COV_DIR)/report.md
+
+# ---------------------------------------------------------------- baseline
+# Before/after: builds the ORIGINAL vertex_fetch and pixel_map straight from
+# the `baseline` git tag and measures them on the same workloads as the new
+# units' tests. -> out/baseline_bench.txt
+BASE_DIR   := $(BUILD_DIR)/baseline
+BASE_FLAGS := $(filter-out -Wall,$(VFLAGS)) -Wno-fatal
+.PHONY: baseline-bench
+baseline-bench:
+	@mkdir -p $(BASE_DIR)/rtl out
+	git -c safe.directory='*' show baseline:rtl/vertex_fetch.sv > $(BASE_DIR)/rtl/vertex_fetch.sv
+	git -c safe.directory='*' show baseline:rtl/pixel_map.sv > $(BASE_DIR)/rtl/pixel_map.sv
+	$(VERILATOR) $(BASE_FLAGS) --cc --exe --top-module vertex_fetch -Mdir $(BASE_DIR)/fetch \
+		$(abspath $(BASE_DIR)/rtl/vertex_fetch.sv) $(abspath bench/baseline_fetch_bench.cpp) > $(BASE_DIR)/fetch.log 2>&1
+	$(VERILATOR) $(BASE_FLAGS) --cc --exe --top-module pixel_map -GSCREEN_W=320 -GSCREEN_H=240 \
+		-Mdir $(BASE_DIR)/pixel $(abspath $(BASE_DIR)/rtl/pixel_map.sv) $(abspath bench/baseline_pixel_bench.cpp) \
+		> $(BASE_DIR)/pixel.log 2>&1
+	@{ $(BASE_DIR)/fetch/Vvertex_fetch $(RUN_ARGS) && $(BASE_DIR)/pixel/Vpixel_map $(RUN_ARGS); } | tee out/baseline_bench.txt
 
 # Re-run the (already built) regression with several stimulus seeds.
 SEEDS ?= 2 3 4 5 6

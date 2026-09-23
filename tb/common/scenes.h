@@ -114,6 +114,26 @@ inline Scene cube(double aspect, double angle) {
     return s;
 }
 
+// Demo frame t in [0, 1): a large rotating cube and a small cube orbiting
+// through it. Two draws (CLEAR+DRAW, then DRAW) share one depth buffer, so
+// the intersection is resolved per pixel.
+inline std::vector<Scene> demo_frame(double aspect, double t) {
+    const double a = 2.0 * M_PI * t;
+    Scene big;
+    big.name = "demo_big";
+    add_cube(big, 1.3);
+    big.set_mvp(camera(aspect) * rot_y(a) * rot_x(0.5 + 0.35 * std::sin(a)));
+    big.cull_back = true;
+    big.clear_color = gpu_rgb565(16, 16, 40);
+    Scene small;
+    small.name = "demo_small";
+    add_cube(small, 0.7);
+    small.set_mvp(camera(aspect) * translate(0.95 * std::cos(2 * a), 0.25 * std::sin(a), 0.95 * std::sin(2 * a)) *
+                  rot_x(3 * a) * rot_z(2 * a));
+    small.cull_back = true;
+    return {big, small};
+}
+
 // Random triangles in and around the view volume: some behind the camera,
 // some off-screen, some huge, both windings; culling on or off.
 inline Scene random_tris(double aspect, uint64_t seed, int n) {

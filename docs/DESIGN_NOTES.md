@@ -408,3 +408,53 @@ coverage (any failed check fails the job), publishes the coverage table to
 the run summary, and then reruns the regression with a per-run seed. Every
 randomised test prints its seed on its PASS/FAIL line, so a CI failure
 reproduces locally with `make all SEED=<n>`.
+
+---
+
+## Phase 8: Performance and demo
+
+All numbers here are cycle counts from simulation, read from the hardware
+performance counters (system level) or counted by the unit testbench. They
+become time only when divided by the post-route Fmax (phase 9).
+
+**Before/after for the replaced units (`make baseline-bench`).** The original
+`vertex_fetch` and `pixel_map` are built straight from the `baseline` git tag
+and measured on the same workloads as their replacements' tests:
+
+| Unit | Baseline | New | Speed-up |
+|---|---:|---:|---:|
+| vertex fetch, 256 vertices, ideal memory | 11.00 cycles/vertex | 4.02 | 2.7x |
+| vertex fetch, 256 vertices, 32-cycle read latency | 42.00 cycles/vertex | 4.14 | 10.1x |
+| depth test + framebuffer write, 76,800 fragments | 3.00 cycles/fragment | 1.00 | 3.0x |
+
+The latency row shows the value of prefetch. The baseline pays the full
+memory latency on every vertex, while the new unit keeps 4 bursts in flight
+and stays near the bus limit.
+
+**Rasterizer span width at system level (`make perf`).** These are DRAW-only
+commands, with clear excluded, through the whole pipeline. Every run is also
+compared with the model.
+
+| Scene | SPAN=1 | SPAN=2 | SPAN=4 | SPAN=8 |
+|---|---:|---:|---:|---:|
+| demo cube (4 triangles rasterized, 13,674 fragments) | 29,520 | 21,478 | 17,280 | 14,899 |
+| random_3 (85 rasterized, 54,610 fragments) | 151,361 | 101,551 | 75,695 | 62,076 |
+| random_8 (185 rasterized, 195,867 fragments) | 609,442 | 398,550 | 290,301 | 233,256 |
+
+Draw cycles; SPAN 1 to 4 is 1.71x, 2.00x and 2.10x faster respectively. The
+default is SPAN=4, and SPAN=8 still gains 14–20% for twice the edge-test
+hardware. Whether it pays off depends on its LUT cost and Fmax, which only the
+Vivado sweep can tell.
+
+**Where the frame time goes.** In the demo (two cubes, 48 frames),
+`PERF_CYCLES` averages 100,663 cycles per frame, including the 76,801-cycle
+clear. The hardware clear is the largest single cost, which is why it is at the
+top of the future-work list.
+
+**Demo (`make demo`).** It renders 48 frames of a rotating cube with a smaller
+cube orbiting through it, as two draws per frame sharing one depth buffer,
+with per-vertex colour, perspective and back-face culling. Every frame goes
+through the driver, is compared with the golden model (all pixels match),
+and is read back through the hardware port to `out/demo/*.ppm`.
+`scripts/make_gif.py` converts the frames into `docs/img/demo.gif` without
+touching pixel values (2x nearest-neighbour upscale, GIF palette).
