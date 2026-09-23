@@ -380,3 +380,31 @@ jittered register bus (the frames must be identical); a command written while
 busy (ignored); the IRQ pin; a bus error mid-draw (FETCH_ERR, abandoned
 draw, clean recovery); and a partial trailing triangle. Every frame and
 every counter matches the golden model exactly.
+
+---
+
+## Phase 7: Coverage and CI
+
+**Decision: line (block/branch) coverage over the whole regression, reported
+per module.** Every test is built with `--coverage-line`, and `make coverage`
+merges the databases. `scripts/coverage_report.py` counts a point as covered
+if it is hit in any instance, and lists every uncovered point by line rather
+than only printing an average. Line coverage shows which code ran, not that
+it was checked; the checking comes from the model comparisons.
+
+**Result (make coverage, Verilator 5.020): 349 of 353 points, 98.9%.** The
+four uncovered points, with evidence for each:
+
+| Point | Why it is not covered |
+|---|---|
+| `gpu_ctrl.sv` `default:` of the state case | Unreachable: 5 enum states in 3 bits; only reachable by an upset flop. Kept as a recovery path. |
+| `tri_setup.sv` `default:` of the state case | Same (7 states in 3 bits). |
+| `rasterizer.sv` attribute clamp, low and high branches | Unreachable in practice. The clamp guards against rounding outside the vertex range. A model-only search over 2,946,815 worst-case sliver triangles (97.8 M fragments, extreme attribute values) found a worst overshoot of 0.0049 LSB, about 100x below the 0.5 LSB needed to trigger it. A sliver stress test was added to the RTL regression too. I kept the clamp because this is an empirical bound, not a proof. |
+
+**Decision: CI runs the same toolchain as local runs.** GitHub Actions on
+`ubuntu-24.04` installs the distro Verilator (5.020), which is the same
+package as `docker/Dockerfile`. The workflow lints, runs the regression with
+coverage (any failed check fails the job), publishes the coverage table to
+the run summary, and then reruns the regression with a per-run seed. Every
+randomised test prints its seed on its PASS/FAIL line, so a CI failure
+reproduces locally with `make all SEED=<n>`.

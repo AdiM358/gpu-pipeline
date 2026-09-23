@@ -1,0 +1,48 @@
+name: regression
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  regression:
+    # Ubuntu 24.04 ships Verilator 5.020, the version used for every result
+    # in this repository (docker/Dockerfile installs the same package).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends verilator make g++ python3
+          verilator --version
+
+      - name: Lint
+        run: make lint
+
+      # Builds every test with line coverage and runs the whole regression;
+      # fails if any check in any test fails.
+      - name: Regression with coverage
+        run: make coverage
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f build/cov/report.md ]; then
+            { echo "## Line coverage"; echo; cat build/cov/report.md; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Randomised tests again with a per-run seed (printed on every PASS/FAIL
+      # line, so any failure is reproducible with `make all SEED=<n>`).
+      - name: Regression with a fresh seed
+        run: make all SEED=${{ github.run_number }}
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            build/cov/report.md
+            build/cov/annotated

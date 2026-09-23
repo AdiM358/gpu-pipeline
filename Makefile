@@ -4,6 +4,7 @@
 #   make test-<name>    build + run one test (e.g. make test-rasterizer)
 #   make TRACE=1 ...    build with VCD support (run a test binary with +trace)
 #   make SEED=7 ...     stimulus seed passed to every test as +seed=N
+#   make coverage       all tests with line coverage, merged, per-module report
 #   make clean
 #
 # Each test is tb/<name>_tb.cpp driving top module <name> unless overridden
@@ -47,7 +48,7 @@ top_rasterizer_s8   := rasterizer
 src_rasterizer_s8   := tb/rasterizer_tb.cpp
 vflags_rasterizer_s8 := -GSPAN=8
 
-.PHONY: all clean lint $(addprefix test-,$(TESTS))
+.PHONY: all clean lint coverage seeds $(addprefix test-,$(TESTS))
 
 all: $(addprefix test-,$(TESTS))
 	@echo "All $(words $(TESTS)) tests passed."
@@ -65,10 +66,25 @@ $$(build_$(1))/V$$(top_$(1)): $(RTL) $$(src_$(1)) $(TB_COMMON) Makefile
 		|| { cat $$(build_$(1))/build.log; exit 1; }
 
 test-$(1): $$(build_$(1))/V$$(top_$(1))
-	@cd $$(build_$(1)) && ./V$$(top_$(1)) $(RUN_ARGS) +cov=$(CURDIR)/$$(build_$(1))/coverage.dat $$(args_$(1))
+	@cd $$(build_$(1)) && ./V$$(top_$(1)) $(RUN_ARGS) +cov=$$(abspath $$(build_$(1)))/coverage.dat $$(args_$(1))
 endef
 
 $(foreach t,$(TESTS),$(eval $(call TEST_RULES,$(t))))
+
+# Line coverage over the whole regression. Each test writes coverage.dat;
+# they are merged and summarised per RTL file (one module per file).
+COV_DIR := $(BUILD_DIR)/cov
+coverage:
+	$(MAKE) BUILD_DIR=$(COV_DIR) COVERAGE=1 all
+	verilator_coverage --write $(COV_DIR)/merged.dat $(COV_DIR)/*/coverage.dat
+	rm -rf $(COV_DIR)/annotated
+	verilator_coverage --annotate $(COV_DIR)/annotated --annotate-min 1 $(COV_DIR)/merged.dat
+	python3 scripts/coverage_report.py $(COV_DIR)/merged.dat | tee $(COV_DIR)/report.md
+
+# Re-run the (already built) regression with several stimulus seeds.
+SEEDS ?= 2 3 4 5 6
+seeds: all
+	@for s in $(SEEDS); do $(MAKE) --no-print-directory all SEED=$$s || exit 1; done
 
 lint:
 	$(VERILATOR) --lint-only -Wall --top-module gpu_top $(RTL)
