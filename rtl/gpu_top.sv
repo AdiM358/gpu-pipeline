@@ -77,7 +77,7 @@ module gpu_top #(
 
     // Fetch -> Geom interconnect
     logic signed [31:0] fetch_vx, fetch_vy, fetch_vz;
-    logic [31:0] fetch_color;
+    logic [23:0] fetch_color;
     logic fetch_valid, fetch_ready;
 
     // Geom -> Persp interconnect
@@ -87,11 +87,19 @@ module gpu_top #(
     logic signed [31:0] clip_z /* verilator public */;
     logic signed [31:0] clip_w /* verilator public */;
 
-    logic [31:0]        clip_color /* verilator public */;
+    logic [23:0]        clip_color /* verilator public */;
     logic               clip_valid /* verilator public */;
     logic               clip_ready /* verilator public */;
     /* verilator lint_on UNUSEDSIGNAL */
 
+
+    logic geom_idle, persp_idle;
+    logic signed [15:0] scr_sx, scr_sy;
+    logic [15:0] scr_z;
+    logic [23:0] scr_color;
+    /* verilator lint_off UNUSEDSIGNAL */
+    logic [7:0]  scr_flags;   // consumed by triangle setup (next phase)
+    /* verilator lint_on UNUSEDSIGNAL */
 
     // Persp -> Prim Assembly interconnect
     logic signed [31:0] screen_x, screen_y, screen_z;
@@ -166,7 +174,7 @@ module gpu_top #(
     // pixel map are waiting for input. gpu_ctrl additionally requires this to
     // hold for several consecutive cycles to cover the stages' internal
     // pipeline registers.
-    wire pipe_idle = !fetch_valid && !clip_valid && !screen_valid && !tri_valid &&
+    wire pipe_idle = geom_idle && persp_idle && !tri_valid &&
                      tri_ready && !frag_valid && frag_ready;
 
     gpu_ctrl #(
@@ -238,51 +246,55 @@ module gpu_top #(
     );
 
     // Geometry Engine
-    geom_engine #(
-        .DATA_WIDTH (AXI_DATA_WIDTH),
-        .FRAC_BITS  (FRAC_BITS)
-    ) u_geom_engine (
-        .clk              (clk),
-        .rst_n            (rst_n),
-        .mvp_matrix       (mvp_matrix),
-        .s_stream_vx      (fetch_vx),
-        .s_stream_vy      (fetch_vy),
-        .s_stream_vz      (fetch_vz),
-        .s_stream_color   (fetch_color),
-        .s_stream_valid   (fetch_valid),
-        .s_stream_ready   (fetch_ready),
-        .m_stream_x_clip  (clip_x),
-        .m_stream_y_clip  (clip_y),
-        .m_stream_z_clip  (clip_z),
-        .m_stream_w_clip  (clip_w),
-        .m_stream_color   (clip_color),
-        .m_stream_valid   (clip_valid),
-        .m_stream_ready   (clip_ready)
+    geom_engine u_geom_engine (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .mvp        (mvp_matrix),
+        .in_x       (fetch_vx),
+        .in_y       (fetch_vy),
+        .in_z       (fetch_vz),
+        .in_color   (fetch_color),
+        .in_valid   (fetch_valid),
+        .in_ready   (fetch_ready),
+        .out_x      (clip_x),
+        .out_y      (clip_y),
+        .out_z      (clip_z),
+        .out_w      (clip_w),
+        .out_color  (clip_color),
+        .out_valid  (clip_valid),
+        .out_ready  (clip_ready),
+        .idle       (geom_idle)
     );
 
     // Perspective Divide & Viewport Scaling
     persp_viewport #(
-        .DATA_WIDTH (AXI_DATA_WIDTH),
-        .FRAC_BITS  (FRAC_BITS),
         .SCREEN_W   (SCREEN_W),
         .SCREEN_H   (SCREEN_H)
     ) u_persp_viewport (
-        .clk               (clk),
-        .rst_n             (rst_n),
-        .s_stream_x_clip   (clip_x),
-        .s_stream_y_clip   (clip_y),
-        .s_stream_z_clip   (clip_z),
-        .s_stream_w_clip   (clip_w),
-        .s_stream_color    (clip_color),
-        .s_stream_valid    (clip_valid),
-        .s_stream_ready    (clip_ready),
-        .m_stream_x_screen (screen_x),
-        .m_stream_y_screen (screen_y),
-        .m_stream_z_depth  (screen_z),
-        .m_stream_color    (screen_color),
-        .m_stream_valid    (screen_valid),
-        .m_stream_ready    (screen_ready)
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .in_x       (clip_x),
+        .in_y       (clip_y),
+        .in_z       (clip_z),
+        .in_w       (clip_w),
+        .in_color   (clip_color),
+        .in_valid   (clip_valid),
+        .in_ready   (clip_ready),
+        .out_sx     (scr_sx),
+        .out_sy     (scr_sy),
+        .out_z      (scr_z),
+        .out_color  (scr_color),
+        .out_flags  (scr_flags),
+        .out_valid  (screen_valid),
+        .out_ready  (screen_ready),
+        .idle       (persp_idle)
     );
+
+    // Interim shim: the baseline assembly/rasterizer still take Q16.16.
+    assign screen_x     = {{4{scr_sx[15]}}, scr_sx, 12'b0};
+    assign screen_y     = {{4{scr_sy[15]}}, scr_sy, 12'b0};
+    assign screen_z     = {16'b0, scr_z};
+    assign screen_color = {8'b0, scr_color};
 
     // Primitive Assembly
     prim_assembly #(

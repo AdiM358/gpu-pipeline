@@ -18,14 +18,15 @@ TRACE     ?= 0
 COVERAGE  ?= 0
 
 RTL       := $(abspath $(wildcard rtl/*.sv))
-TB_COMMON := $(wildcard tb/common/*.h tb/common/*.cpp sw/*.h sw/*.hpp)
+MODEL_SRC := $(abspath model/gpu_model.cpp)
+TB_COMMON := $(wildcard tb/common/*.h tb/common/*.cpp sw/*.h sw/*.hpp model/*.h) $(MODEL_SRC)
 
-TESTS := axil_regs vertex_fetch geom_engine persp_viewport \
+TESTS := axil_regs vertex_fetch geom_engine recip_pipe persp_viewport \
          prim_assembly rasterizer pixel_map gpu_top
 
 VFLAGS := -Wall --x-assign unique --x-initial unique -O3 \
           --build -j $(JOBS) \
-          -CFLAGS "-std=c++17 -O2 -I$(CURDIR)/tb/common -I$(CURDIR)/sw"
+          -CFLAGS "-std=c++20 -O2 -I$(CURDIR)/tb/common -I$(CURDIR)/sw -I$(CURDIR)/model"
 ifeq ($(TRACE),1)
   VFLAGS += --trace
 endif
@@ -34,6 +35,9 @@ ifeq ($(COVERAGE),1)
 endif
 
 RUN_ARGS := +seed=$(SEED) +verilator+seed+$(SEED)
+
+# Per-test overrides
+vflags_recip_pipe := -GPAY_W=32
 
 .PHONY: all clean lint $(addprefix test-,$(TESTS))
 
@@ -49,7 +53,7 @@ build_$(1) := $(BUILD_DIR)/$(1)
 $$(build_$(1))/V$$(top_$(1)): $(RTL) $$(src_$(1)) $(TB_COMMON) Makefile
 	@mkdir -p $$(build_$(1))
 	$(VERILATOR) $(VFLAGS) --cc --exe --top-module $$(top_$(1)) \
-		-Mdir $$(build_$(1)) $$(vflags_$(1)) $(RTL) $$(abspath $$(src_$(1))) > $$(build_$(1))/build.log 2>&1 \
+		-Mdir $$(build_$(1)) $$(vflags_$(1)) $(RTL) $$(abspath $$(src_$(1))) $(MODEL_SRC) > $$(build_$(1))/build.log 2>&1 \
 		|| { cat $$(build_$(1))/build.log; exit 1; }
 
 test-$(1): $$(build_$(1))/V$$(top_$(1))
