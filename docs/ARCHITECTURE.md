@@ -9,7 +9,9 @@ board.
 This document explains what each piece does and why it has the shape it has.
 The decision-by-decision reasoning, with measurements, is in
 [DESIGN_NOTES.md](DESIGN_NOTES.md), the register interface is in
-[REGMAP.md](REGMAP.md), and the original audit is in [PLAN.md](PLAN.md).
+[REGMAP.md](REGMAP.md), the cycle-level ASM (state machine) charts for every
+controller are in [ASM.md](ASM.md), and the original audit is in
+[PLAN.md](PLAN.md).
 
 ---
 
