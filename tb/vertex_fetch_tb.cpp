@@ -1,5 +1,5 @@
 #include <iostream>
-#include <cassert>
+#include "sim.h"
 #include <memory>
 #include <vector>
 #include <verilated.h>
@@ -32,23 +32,29 @@ struct Testbench {
 
     Testbench() {
         top = std::make_unique<Vvertex_fetch>();
+#if VM_TRACE
         Verilated::traceEverOn(true);
         trace = std::make_unique<VerilatedVcdC>();
         top->trace(trace.get(), 99);
         trace->open("waveform.vcd");
+#endif
         
         // Allocate 1 KB simulated VRAM space
         vram.resize(256, 0);
     }
 
     ~Testbench() {
-        trace->close();
+#if VM_TRACE
+        if (trace) trace->close();
+#endif
     }
 
     void tick() {
         top->clk = !top->clk;
         top->eval();
-        trace->dump(main_time);
+#if VM_TRACE
+        if (trace) trace->dump(main_time);
+#endif
         main_time++;
     }
 
@@ -151,7 +157,7 @@ int main(int argc, char** argv) {
     tb->top->start_pulse = 0; // Self-clear pulse
 
     // Assert fetch engine transitioned to busy
-    assert(tb->top->busy == 1 && "fetch engine failed to enter busy state");
+    CHECK_MSG(tb->top->busy == 1, "fetch engine failed to enter busy state");
 
     // Enable downstream stream receiver (Geometry Engine ready)
     tb->top->stream_ready = 1;
@@ -161,7 +167,7 @@ int main(int argc, char** argv) {
     while (!tb->top->stream_valid) {
         tb->clock_cycle();
         timeout++;
-        assert(timeout < 100 && "Timeout waiting for Vertex 0 stream_valid");
+        if (!(timeout < 100)) FATAL("Timeout waiting for Vertex 0 stream_valid");
     }
 
     std::cout << "Stream received Vertex 0: X=0x" << std::hex << tb->top->stream_vx 
@@ -169,11 +175,10 @@ int main(int argc, char** argv) {
               << " Z=0x" << tb->top->stream_vz 
               << " Color=0x" << tb->top->stream_color << std::dec << std::endl;
 
-    assert(tb->top->stream_vx == v0.x && "v0 X mismatch");
-    assert(tb->top->stream_vy == v0.y && "v0 Y mismatch");
-    assert(tb->top->stream_vz == v0.z && "v0 Z mismatch");
-    assert(tb->top->stream_color == v0.color && "v0 Color mismatch");
-    std::cout << "Test 1 passed: Vertex 0 fetched correctly." << std::endl;
+    CHECK_MSG(tb->top->stream_vx == v0.x, "v0 X mismatch");
+    CHECK_MSG(tb->top->stream_vy == v0.y, "v0 Y mismatch");
+    CHECK_MSG(tb->top->stream_vz == v0.z, "v0 Z mismatch");
+    CHECK_MSG(tb->top->stream_color == v0.color, "v0 Color mismatch");
 
     tb->clock_cycle(); // Handshake completes
 
@@ -182,7 +187,7 @@ int main(int argc, char** argv) {
     while (!tb->top->stream_valid) {
         tb->clock_cycle();
         timeout++;
-        assert(timeout < 100 && "Timeout waiting for Vertex 1 stream_valid");
+        if (!(timeout < 100)) FATAL("Timeout waiting for Vertex 1 stream_valid");
     }
 
     std::cout << "Stream received Vertex 1: X=0x" << std::hex << tb->top->stream_vx 
@@ -190,11 +195,10 @@ int main(int argc, char** argv) {
               << " Z=0x" << tb->top->stream_vz 
               << " Color=0x" << tb->top->stream_color << std::dec << std::endl;
 
-    assert(tb->top->stream_vx == v1.x && "v1 X mismatch");
-    assert(tb->top->stream_vy == v1.y && "v1 Y mismatch");
-    assert(tb->top->stream_vz == v1.z && "v1 Z mismatch");
-    assert(tb->top->stream_color == v1.color && "v1 Color mismatch");
-    std::cout << "Test 2 passed: Vertex 1 fetched correctly." << std::endl;
+    CHECK_MSG(tb->top->stream_vx == v1.x, "v1 X mismatch");
+    CHECK_MSG(tb->top->stream_vy == v1.y, "v1 Y mismatch");
+    CHECK_MSG(tb->top->stream_vz == v1.z, "v1 Z mismatch");
+    CHECK_MSG(tb->top->stream_color == v1.color, "v1 Color mismatch");
 
     tb->clock_cycle(); // Handshake completes
 
@@ -203,15 +207,13 @@ int main(int argc, char** argv) {
     while (!tb->top->done_pulse) {
         tb->clock_cycle();
         timeout++;
-        assert(timeout < 50 && "Timeout waiting for done_pulse");
+        if (!(timeout < 50)) FATAL("Timeout waiting for done_pulse");
     }
 
-    assert(tb->top->done_pulse == 1 && "done_pulse missing");
-    std::cout << "Test 3 passed: done_pulse asserted." << std::endl;
+    CHECK_MSG(tb->top->done_pulse == 1, "done_pulse missing");
 
     tb->clock_cycle();
-    assert(tb->top->busy == 0 && "fetch engine failed to return to IDLE");
+    CHECK_MSG(tb->top->busy == 0, "fetch engine failed to return to IDLE");
 
-    std::cout << "Vertex fetch unit tests passed." << std::endl;
-    return 0;
+    return tb::summarize("vertex_fetch", tb->main_time / 2, 1);
 }

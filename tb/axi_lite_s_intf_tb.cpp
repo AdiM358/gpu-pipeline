@@ -1,5 +1,5 @@
 #include <iostream>
-#include <cassert>
+#include "sim.h"
 #include <memory>
 #include <verilated.h>
 #include <verilated_vcd_c.h>
@@ -12,20 +12,26 @@ struct Testbench {
 
     Testbench() {
         top = std::make_unique<Vaxi_lite_s_intf>();
+#if VM_TRACE
         Verilated::traceEverOn(true);
         trace = std::make_unique<VerilatedVcdC>();
         top->trace(trace.get(), 99);
         trace->open("waveform.vcd");
+#endif
     }
 
     ~Testbench() {
-        trace->close();
+#if VM_TRACE
+        if (trace) trace->close();
+#endif
     }
 
     void tick() {
         top->S_AXI_CLK = !top->S_AXI_CLK;
         top->eval();
-        trace->dump(main_time);
+#if VM_TRACE
+        if (trace) trace->dump(main_time);
+#endif
         main_time++;
     }
 
@@ -81,7 +87,7 @@ struct Testbench {
             timeout++;
             if (timeout > 20) {
                 std::cout << "Error: Timeout waiting for BVALID." << std::endl;
-                assert(false);
+                FATAL("timeout");
             }
         }
 
@@ -104,35 +110,29 @@ int main(int argc, char** argv) {
     // 1. Test VBUF_BASE_ADDR (Offset 0x04 -> Register 1)
     uint32_t test_vbuf_addr = 0x80000000;
     tb->axi_write(0x04, test_vbuf_addr);
-    assert(tb->top->vbuf_base_addr == test_vbuf_addr && "vbuf_base_addr mismatch");
-    std::cout << "Test 1 passed: VBUF base address." << std::endl;
+    CHECK_MSG(tb->top->vbuf_base_addr == test_vbuf_addr, "vbuf_base_addr mismatch");
 
     // 2. Test VERTEX_COUNT (Offset 0x08 -> Register 2)
     uint32_t test_vcount = 300;
     tb->axi_write(0x08, test_vcount);
-    assert(tb->top->vertex_count == test_vcount && "vertex_count mismatch");
-    std::cout << "Test 2 passed: Vertex count." << std::endl;
+    CHECK_MSG(tb->top->vertex_count == test_vcount, "vertex_count mismatch");
 
     // 3. Test MVP Matrix M00 (Offset 0x10 -> Register 4)
     uint32_t test_m00 = 0x0000C000;
     tb->axi_write(0x10, test_m00);
-    assert(tb->top->mvp_matrix[0][0] == static_cast<int32_t>(test_m00) && "MVP[0][0] mismatch");
-    std::cout << "Test 3 passed: MVP matrix M00." << std::endl;
+    CHECK_MSG(tb->top->mvp_matrix[0][0] == static_cast<int32_t>(test_m00), "MVP[0][0] mismatch");
 
     // 4. Test MVP Matrix M32 (Offset 0x48 -> Register 18 -> reg_file[14])
     uint32_t test_m32 = 0xffff0000;
     tb->axi_write(0x48, test_m32);
-    assert(tb->top->mvp_matrix[3][2] == static_cast<int32_t>(test_m32) && "MVP[3][2] mismatch");
-    std::cout << "Test 4 passed: MVP matrix M32." << std::endl;
+    CHECK_MSG(tb->top->mvp_matrix[3][2] == static_cast<int32_t>(test_m32), "MVP[3][2] mismatch");
 
     // 5. Test Start Pulse Generation (Offset 0x00 -> Register 0, bit 0)
     bool pulse_detected = tb->axi_write(0x00, 0x00000001);
-    assert(pulse_detected && "start_pulse was not detected during write to reg 0");
+    CHECK_MSG(pulse_detected, "start_pulse was not detected during write to reg 0");
     
     // Check that start_pulse automatically cleared after the transfer
-    assert(tb->top->start_pulse == 0 && "start_pulse failed to auto-clear");
-    std::cout << "Test 5 passed: Start pulse generation and auto-clearing." << std::endl;
+    CHECK_MSG(tb->top->start_pulse == 0, "start_pulse failed to auto-clear");
 
-    std::cout << "Axi-lite control register file tests passed." << std::endl;
-    return 0;
+    return tb::summarize("axi_lite_s_intf", tb->main_time / 2, 1);
 }

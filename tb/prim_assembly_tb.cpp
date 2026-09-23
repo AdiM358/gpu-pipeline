@@ -1,5 +1,5 @@
 #include <iostream>
-#include <cassert>
+#include "sim.h"
 #include <memory>
 #include <verilated.h>
 #include <verilated_vcd_c.h>
@@ -12,20 +12,26 @@ struct Testbench {
 
     Testbench() {
         top = std::make_unique<Vprim_assembly>();
+#if VM_TRACE
         Verilated::traceEverOn(true);
         trace = std::make_unique<VerilatedVcdC>();
         top->trace(trace.get(), 99);
         trace->open("waveform.vcd");
+#endif
     }
 
     ~Testbench() {
-        trace->close();
+#if VM_TRACE
+        if (trace) trace->close();
+#endif
     }
 
     void tick() {
         top->clk = !top->clk;
         top->eval();
-        trace->dump(main_time);
+#if VM_TRACE
+        if (trace) trace->dump(main_time);
+#endif
         main_time++;
     }
 
@@ -86,7 +92,7 @@ int main(int argc, char** argv) {
     while (!tb->top->m_tri_valid) {
         tb->clock_cycle();
         timeout++;
-        assert(timeout < 20 && "Timeout waiting for m_tri_valid");
+        if (!(timeout < 20)) FATAL("Timeout waiting for m_tri_valid");
     }
 
     std::cout << "Primitive Assembly Output:" << std::endl;
@@ -94,11 +100,10 @@ int main(int argc, char** argv) {
     std::cout << "  V1: (" << tb->top->m_v1_x << ", " << tb->top->m_v1_y << ", " << tb->top->m_v1_z << ")" << std::endl;
     std::cout << "  V2: (" << tb->top->m_v2_x << ", " << tb->top->m_v2_y << ", " << tb->top->m_v2_z << ")" << std::endl;
 
-    assert(tb->top->m_v0_x == 10 && tb->top->m_v0_y == 20 && tb->top->m_v0_z == 30 && "V0 mismatch");
-    assert(tb->top->m_v1_x == 40 && tb->top->m_v1_y == 50 && tb->top->m_v1_z == 60 && "V1 mismatch");
-    assert(tb->top->m_v2_x == 70 && tb->top->m_v2_y == 80 && tb->top->m_v2_z == 90 && "V2 mismatch");
-    assert(tb->top->m_color == 0xFF0000FF && "Color mismatch");
+    CHECK_MSG(tb->top->m_v0_x == 10 && tb->top->m_v0_y == 20 && tb->top->m_v0_z == 30, "V0 mismatch");
+    CHECK_MSG(tb->top->m_v1_x == 40 && tb->top->m_v1_y == 50 && tb->top->m_v1_z == 60, "V1 mismatch");
+    CHECK_MSG(tb->top->m_v2_x == 70 && tb->top->m_v2_y == 80 && tb->top->m_v2_z == 90, "V2 mismatch");
+    CHECK_MSG(tb->top->m_color == 0xFF0000FF, "Color mismatch");
 
-    std::cout << "Primitive assembly unit tests passed." << std::endl;
-    return 0;
+    return tb::summarize("prim_assembly", tb->main_time / 2, 1);
 }
