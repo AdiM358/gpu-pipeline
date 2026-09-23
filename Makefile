@@ -18,14 +18,14 @@ TRACE     ?= 0
 COVERAGE  ?= 0
 
 RTL       := $(abspath $(wildcard rtl/*.sv))
-TB_COMMON := $(wildcard tb/common/*.h tb/common/*.cpp)
+TB_COMMON := $(wildcard tb/common/*.h tb/common/*.cpp sw/*.h sw/*.hpp)
 
-TESTS := axi_lite_s_intf vertex_fetch geom_engine persp_viewport \
+TESTS := axil_regs vertex_fetch geom_engine persp_viewport \
          prim_assembly rasterizer pixel_map gpu_top
 
 VFLAGS := -Wall --x-assign unique --x-initial unique -O3 \
           --build -j $(JOBS) \
-          -CFLAGS "-std=c++17 -O2 -I$(CURDIR)/tb/common"
+          -CFLAGS "-std=c++17 -O2 -I$(CURDIR)/tb/common -I$(CURDIR)/sw"
 ifeq ($(TRACE),1)
   VFLAGS += --trace
 endif

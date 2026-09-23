@@ -1,8 +1,9 @@
 // Shared Verilator testbench harness.
 //
 // - CHECK / CHECK_EQ record failures instead of aborting (and are not
-//   compiled out by NDEBUG the way assert() is). tb::finish() turns the
-//   tally into the process exit code, so `make` fails on any failed check.
+//   compiled out by NDEBUG the way assert() is). The harness turns the
+//   tally into the process exit code (Sim::finish / tb::summarize), so
+//   `make` fails on any failed check.
 // - Plusargs: +seed=N (stimulus RNG), +trace (VCD dump, needs TRACE=1 build),
 //   +cov=FILE (coverage output, needs COVERAGE=1 build).
 // - Cycle model: the testbench drives inputs, calls tick() (one posedge),
@@ -24,6 +25,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <vector>
 
 namespace tb {
 
@@ -101,6 +103,17 @@ inline std::string fmt(const char* f, ...) {
 
 namespace tb {
 
+// A bus model or monitor serviced on every clock edge.
+//   observe(): called just before the rising edge with all signals settled;
+//              a handshake seen here (valid && ready) happens at this edge.
+//   drive():   called just after the rising edge; set inputs for next cycle.
+class Agent {
+public:
+    virtual ~Agent() = default;
+    virtual void observe() {}
+    virtual void drive() {}
+};
+
 // Owns the Verilator context, the DUT, optional tracing and coverage.
 // DUT must have `clk` and `rst_n` ports.
 template <class DUT>
@@ -128,18 +141,28 @@ public:
         dut->eval();
     }
 
+    // Teardown order matters: trace, then model, then context (Verilator
+    // aborts if the context goes away while a model still references it).
     ~Sim() {
 #if VM_TRACE
         if (trace_) trace_->close();
+        trace_.reset();
 #endif
+        dut.reset();
+        ctx_.reset();
     }
+
+    void add_agent(Agent* a) { agents_.push_back(a); }
 
     // One full clock cycle: rising edge then falling edge.
     void tick() {
+        dut->eval();
+        for (Agent* a : agents_) a->observe();
         dut->clk = 1;
         dut->eval();
         dump();
         ++cycle;
+        for (Agent* a : agents_) a->drive();
         dut->clk = 0;
         dut->eval();
         dump();
@@ -186,6 +209,7 @@ private:
     }
 
     std::string name_;
+    std::vector<Agent*> agents_;
     std::unique_ptr<VerilatedContext> ctx_;
 #if VM_TRACE
     std::unique_ptr<VerilatedVcdC> trace_;

@@ -1,321 +1,120 @@
-#include <iostream>
-#include "sim.h"
-#include <memory>
+// gpu_top system test (interim, baseline datapath): drives the GPU purely
+// through the C++ driver over AXI4-Lite and checks the command/counter
+// plumbing. Pixel-exact checks arrive with the new datapath and golden model.
+#include <cmath>
 #include <vector>
-#include <verilated.h>
-#include <verilated_vcd_c.h>
+
 #include "Vgpu_top.h"
-#include "Vgpu_top___024root.h"
-#include "Vgpu_top_gpu_top.h"
-#include <fstream>
-#include <iomanip>
-#include "Vgpu_top_framebuffer.h"
+#include "axi_mem.h"
+#include "axil_master.h"
+#include "gpu_driver.hpp"
+#include "sim.h"
 
-constexpr int32_t to_q16(double val) {
-    return static_cast<int32_t>(val * 65536.0);
-}
+using Dut = Vgpu_top;
 
-struct Vertex {
-    int32_t x;
-    int32_t y;
-    int32_t z;
-    uint32_t color;
-    uint32_t reserved[4];
+namespace {
+
+constexpr uint32_t kVramBase = 0x8000'0000;
+constexpr uint32_t kW = 640, kH = 480;
+
+// External Z-buffer memory used by the baseline pixel_map (1-cycle read).
+struct ZbufModel : tb::Agent {
+    Dut* d;
+    std::vector<int32_t> z;
+    uint64_t fb_writes = 0;
+    explicit ZbufModel(Dut* dut) : d(dut), z(kW * kH, 0x7FFFFFFF) {}
+    void observe() override {
+        if (!d->rst_n) return;  // outputs are random until reset is applied
+        if (d->m_zbuf_wr_en && d->m_zbuf_wr_addr < z.size()) z[d->m_zbuf_wr_addr] = d->m_zbuf_wr_data;
+        if (d->m_fb_wr_en) {
+            ++fb_writes;
+            CHECK_MSG(d->m_fb_wr_addr < kW * kH, "framebuffer write address %u out of range",
+                      d->m_fb_wr_addr);
+        }
+        rd_addr = d->m_zbuf_rd_addr;
+    }
+    void drive() override {
+        if (rd_addr < z.size()) d->s_zbuf_rd_data = z[rd_addr];
+    }
+    uint32_t rd_addr = 0;
 };
 
-struct Testbench {
-    std::unique_ptr<Vgpu_top> top;
-    std::unique_ptr<VerilatedVcdC> trace;
-    uint64_t main_time = 0;
-
-    std::vector<uint32_t> vram;
-    std::vector<int32_t> zbuffer;
-
-    static constexpr uint32_t VRAM_BASE_ADDR = 0x80000000;
-    static constexpr uint32_t SCREEN_W = 640;
-    static constexpr uint32_t SCREEN_H = 480;
-
-    uint32_t active_araddr = 0;
-    uint8_t active_arlen = 0;
-    uint8_t burst_counter = 0;
-    bool burst_in_progress = false;
-
-    Testbench() {
-        top = std::make_unique<Vgpu_top>();
-#if VM_TRACE
-        Verilated::traceEverOn(true);
-        trace = std::make_unique<VerilatedVcdC>();
-        top->trace(trace.get(), 99);
-        trace->open("waveform.vcd");
-#endif
-
-        vram.resize(1024, 0);
-        zbuffer.resize(SCREEN_W * SCREEN_H, 0x7FFFFFFF); // Init to max depth
+void push_tri(tb::AxiMem<Dut>& mem, uint32_t& addr, const double v[9], uint32_t color) {
+    for (int i = 0; i < 3; ++i) {
+        mem.write32(addr + 0, gpu::to_q16(v[3 * i + 0]));
+        mem.write32(addr + 4, gpu::to_q16(v[3 * i + 1]));
+        mem.write32(addr + 8, gpu::to_q16(v[3 * i + 2]));
+        mem.write32(addr + 12, color);
+        addr += 32;  // baseline vertex stride
     }
-
-    ~Testbench() {
-#if VM_TRACE
-        if (trace) trace->close();
-#endif
-    }
-
-    void tick() {
-        top->clk = !top->clk;
-        top->eval();
-#if VM_TRACE
-        if (trace) trace->dump(main_time);
-#endif
-        main_time++;
-    }
-
-    void clock_cycle() {
-        top->clk = 0;
-        tick();
-
-        // Simulate synchronous Z-Buffer read memory
-        if (top->m_zbuf_rd_en && top->m_zbuf_rd_addr < zbuffer.size()) {
-            top->s_zbuf_rd_data = zbuffer[top->m_zbuf_rd_addr];
-        }
-
-        top->clk = 1;
-        service_axi_memory_requests();
-        tick();
-
-        // Handle Z-buffer updates on the rising edge
-        if (top->m_zbuf_wr_en && top->m_zbuf_wr_addr < zbuffer.size()) {
-            zbuffer[top->m_zbuf_wr_addr] = top->m_zbuf_wr_data;
-        }
-    }
-
-    void reset() {
-        top->rst_n = 0;
-
-        top->s_axi_awaddr = 0;
-        top->s_axi_awvalid = 0;
-        top->s_axi_wdata = 0;
-        top->s_axi_wstrb = 0xF;
-        top->s_axi_wvalid = 0;
-        top->s_axi_bready = 0;
-        top->s_axi_araddr = 0;
-        top->s_axi_arvalid = 0;
-        top->s_axi_rready = 0;
-
-        top->m_axi_arready = 0;
-        top->m_axi_rvalid = 0;
-        top->m_axi_rdata = 0;
-        top->m_axi_rresp = 0;
-        top->m_axi_rlast = 0;
-        top->s_zbuf_rd_data = 0;
-
-        for (int i = 0; i < 5; i++) {
-            clock_cycle();
-        }
-        top->rst_n = 1;
-        clock_cycle();
-        std::cout << "Reset complete." << std::endl;
-    }
-
-    void axi_lite_write(uint8_t addr, uint32_t value) {
-        top->s_axi_awaddr  = addr;
-        top->s_axi_awvalid = 1;
-        top->s_axi_wdata   = value;
-        top->s_axi_wvalid  = 1;
-        top->s_axi_bready  = 1;
-
-        bool aw_done = false;
-        bool w_done  = false;
-        int timeout  = 0;
-
-        while (!aw_done || !w_done) {
-            clock_cycle();
-            timeout++;
-            if (timeout >= 100) FATAL("Timeout waiting for AXI-Lite AWREADY/WREADY");
-
-            if (top->s_axi_awready && top->s_axi_awvalid) {
-                top->s_axi_awvalid = 0;
-                aw_done = true;
-            }
-            if (top->s_axi_wready && top->s_axi_wvalid) {
-                top->s_axi_wvalid = 0;
-                w_done = true;
-            }
-        }
-
-        timeout = 0;
-        while (!top->s_axi_bvalid) {
-            clock_cycle();
-            timeout++;
-            if (timeout >= 100) FATAL("Timeout waiting for AXI-Lite BVALID");
-        }
-
-        clock_cycle();
-        top->s_axi_bready = 0;
-    }
-
-    void set_mvp(double rotX_deg, double rotY_deg, double scale) {
-        double rX = rotX_deg * M_PI / 180.0;
-        double rY = rotY_deg * M_PI / 180.0;
-        
-        // MVP = Scale * RotY * RotX
-        double mat[4][4] = {
-            { scale * cos(rY), scale * sin(rX)*sin(rY), scale * cos(rX)*sin(rY), 0.0 },
-            { 0.0,             scale * cos(rX),         scale * -sin(rX),        0.0 },
-            { scale * -sin(rY),scale * sin(rX)*cos(rY), scale * cos(rX)*cos(rY), 0.0 },
-            { 0.0,             0.0,                     0.0,                     1.0 }
-        };
-
-        // Write 16 matrix elements via AXI
-        for (int r = 0; r < 4; r++) {
-            for (int c = 0; c < 4; c++) {
-                uint8_t addr = 0x10 + (r * 4 + c) * 4;
-                axi_lite_write(addr, to_q16(mat[r][c]));
-            }
-        }
-    }
-
-    void load_vertex_into_vram(uint32_t address, const Vertex& v) {
-        uint32_t word_offset = (address - VRAM_BASE_ADDR) / 4;
-
-        vram[word_offset + 0] = static_cast<uint32_t>(v.x);
-        vram[word_offset + 1] = static_cast<uint32_t>(v.y);
-        vram[word_offset + 2] = static_cast<uint32_t>(v.z);
-        vram[word_offset + 3] = v.color;
-        for (int i = 0; i < 4; i++) {
-            vram[word_offset + 4 + i] = v.reserved[i];
-        }
-    }
-
-    void service_axi_memory_requests() {
-        if (top->m_axi_arvalid && !burst_in_progress) {
-            top->m_axi_arready = 1;
-            active_araddr = top->m_axi_araddr;
-            active_arlen = top->m_axi_arlen;
-            burst_counter = 0;
-            burst_in_progress = true;
-        } else {
-            top->m_axi_arready = 0;
-        }
-
-        if (burst_in_progress && top->m_axi_rready) {
-            uint32_t word_offset = (active_araddr - VRAM_BASE_ADDR) / 4 + burst_counter;
-
-            top->m_axi_rdata = vram[word_offset];
-            top->m_axi_rvalid = 1;
-            top->m_axi_rlast = (burst_counter == active_arlen) ? 1 : 0;
-
-            if (top->m_axi_rvalid && top->m_axi_rready) {
-                burst_counter++;
-                if (burst_counter > active_arlen) {
-                    burst_in_progress = false;
-                }
-            }
-        } else if (!burst_in_progress) {
-            top->m_axi_rvalid = 0;
-            top->m_axi_rlast = 0;
-        }
-    }
-
-    void save_framebuffer_to_ppm(const std::string& filename) {
-        std::ofstream file(filename);
-        if (!file.is_open()) {
-            std::cerr << "Failed to open " << filename << " for writing." << std::endl;
-            return;
-        }
-
-        // PPM Header: P3 (Text RGB), Width, Height, Max Color Value (255)
-        file << "P3\n" << SCREEN_W << " " << SCREEN_H << "\n255\n";
-
-        // Read directly from the Verilated memory array
-        for (int y = 0; y < SCREEN_H; y++) {
-            for (int x = 0; x < SCREEN_W; x++) {
-                uint32_t addr = (y * SCREEN_W) + x;
-                
-                // Access the public RAM array inside the framebuffer module
-                uint32_t pixel = top->rootp->gpu_top->u_framebuffer->ram_array[addr];
-
-                // Extract ARGB channels (assuming 0xAARRGGBB format)
-                uint8_t r = (pixel >> 16) & 0xFF;
-                uint8_t g = (pixel >> 8) & 0xFF;
-                uint8_t b = pixel & 0xFF;
-
-                // Write RGB values to file
-                file << (int)r << " " << (int)g << " " << (int)b << " ";
-            }
-            file << "\n"; 
-        }
-
-        file.close();
-        std::cout << "Saved rendered frame to " << filename << std::endl;
-    }
-};
-
-void push_tri(Testbench* tb, uint32_t& addr, 
-              double x0, double y0, double z0, 
-              double x1, double y1, double z1, 
-              double x2, double y2, double z2, uint32_t color) {
-    tb->load_vertex_into_vram(addr, {to_q16(x0), to_q16(y0), to_q16(z0), color, {0}}); addr += 32;
-    tb->load_vertex_into_vram(addr, {to_q16(x1), to_q16(y1), to_q16(z1), color, {0}}); addr += 32;
-    tb->load_vertex_into_vram(addr, {to_q16(x2), to_q16(y2), to_q16(z2), color, {0}}); addr += 32;
 }
+
+}  // namespace
 
 int main(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
-    auto tb = std::make_unique<Testbench>();
+    tb::Sim<Dut> sim(argc, argv, "gpu_top");
+    Dut& d = *sim.dut;
+    tb::AxilMaster<Dut> bus(sim);
+    tb::AxiMem<Dut> mem(sim, kVramBase, 64 * 1024);
+    ZbufModel zbuf(&d);
+    sim.add_agent(&mem);
+    sim.add_agent(&zbuf);
+    gpu::Driver gpu(bus);
 
-    tb->reset();
+    bus.idle();
+    mem.reset_signals();
+    sim.reset();
 
-    // The 8 corners of a cube (Size 0.4x0.4x0.4)
-    double n = -0.2, p = 0.2;
-    uint32_t addr = Testbench::VRAM_BASE_ADDR;
+    CHECK_EQ(gpu.id(), static_cast<uint32_t>(GPU_ID_VALUE));
 
-    // Face 1: Front (Red)
-    push_tri(tb.get(), addr, n, n, n,  p, p, n,  p, n, n, 0x00FF0000);
-    push_tri(tb.get(), addr, n, n, n,  n, p, n,  p, p, n, 0x00FF0000);
-    // Face 2: Back (Cyan)
-    push_tri(tb.get(), addr, p, n, p,  n, p, p,  n, n, p, 0x0000FFFF);
-    push_tri(tb.get(), addr, p, n, p,  p, p, p,  n, p, p, 0x0000FFFF);
-    // Face 3: Left (Green)
-    push_tri(tb.get(), addr, n, n, p,  n, p, n,  n, n, n, 0x0000FF00);
-    push_tri(tb.get(), addr, n, n, p,  n, p, p,  n, p, n, 0x0000FF00);
-    // Face 4: Right (Magenta)
-    push_tri(tb.get(), addr, p, n, n,  p, p, p,  p, n, p, 0x00FF00FF);
-    push_tri(tb.get(), addr, p, n, n,  p, p, n,  p, p, p, 0x00FF00FF);
-    // Face 5: Top (Blue)
-    push_tri(tb.get(), addr, n, p, n,  p, p, p,  p, p, n, 0x000000FF);
-    push_tri(tb.get(), addr, n, p, n,  n, p, p,  p, p, p, 0x000000FF);
-    // Face 6: Bottom (Yellow)
-    // FIX: Not appearing due to constant z-depth used by rasterizer 
-    push_tri(tb.get(), addr, n, n, p,  p, n, n,  p, n, p, 0x00FFFF00);
-    push_tri(tb.get(), addr, n, n, p,  n, n, n,  p, n, n, 0x00FFFF00);
+    // Cube, 12 triangles, same geometry as the original demo.
+    const double n = -0.2, p = 0.2;
+    const double faces[12][9] = {
+        {n, n, n, p, p, n, p, n, n}, {n, n, n, n, p, n, p, p, n},
+        {p, n, p, n, p, p, n, n, p}, {p, n, p, p, p, p, n, p, p},
+        {n, n, p, n, p, n, n, n, n}, {n, n, p, n, p, p, n, p, n},
+        {p, n, n, p, p, p, p, n, p}, {p, n, n, p, p, n, p, p, p},
+        {n, p, n, p, p, p, p, p, n}, {n, p, n, n, p, p, p, p, p},
+        {n, n, p, p, n, n, p, n, p}, {n, n, p, n, n, n, p, n, n},
+    };
+    const uint32_t colors[6] = {0xFF0000, 0x00FFFF, 0x00FF00, 0xFF00FF, 0x0000FF, 0xFFFF00};
+    uint32_t addr = kVramBase;
+    for (int t = 0; t < 12; ++t) push_tri(mem, addr, faces[t], colors[t / 2]);
 
-    // Rotate Cube: X = 35 deg, Y = 45 deg, Scale = 1.0
-    tb->set_mvp(10.0, 15.0, 1.0);
-    tb->axi_lite_write(0x04, Testbench::VRAM_BASE_ADDR);
-    tb->axi_lite_write(0x08, 36); // 12 triangles * 3 vertices
+    const double rx = 10.0 * M_PI / 180, ry = 15.0 * M_PI / 180;
+    const double m[16] = {
+        std::cos(ry), std::sin(rx) * std::sin(ry), std::cos(rx) * std::sin(ry), 0,
+        0, std::cos(rx), -std::sin(rx), 0,
+        -std::sin(ry), std::sin(rx) * std::cos(ry), std::cos(rx) * std::cos(ry), 0,
+        0, 0, 0, 1,
+    };
+    gpu.set_mvp(m);
+    gpu.set_vertex_buffer(kVramBase, 36);
+    gpu.start(false, true);
 
-    tb->axi_lite_write(0x00, 0x00000001); // Trigger GPU
+    uint32_t status = 0;
+    CHECK_MSG(gpu.wait_done(100000, &status), "draw did not complete (STATUS=0x%x)", status);
+    const gpu::PerfCounters pc = gpu.counters();
+    std::printf("  cycles=%u verts=%u tri_in=%u frag_gen=%u frag_pass=%u rast_busy=%u\n",
+                pc.cycles, pc.verts, pc.tri_in, pc.frag_gen, pc.frag_pass, pc.rast_busy);
 
-    std::cout << "Rendering 3D Cube (12 Triangles)..." << std::endl;
-    int fragment_count = 0;
-    int cycles = 0;
-    int last_write = 0;
+    CHECK_EQ(pc.verts, 36u);
+    CHECK_EQ(pc.tri_in, 12u);
+    CHECK_MSG(pc.frag_gen > 1000, "only %u fragments generated", pc.frag_gen);
+    CHECK_EQ(static_cast<uint64_t>(pc.frag_pass), zbuf.fb_writes);
+    CHECK_MSG(pc.frag_pass <= pc.frag_gen, "more depth passes than fragments");
 
-    // Run until the pipeline has been quiet for a long time (the baseline
-    // design has no end-of-frame signal).
-    while (cycles < 250000) {
-        tb->clock_cycle();
-        cycles++;
-        if (tb->top->m_fb_wr_en) {
-            fragment_count++;
-            last_write = cycles;
-            CHECK_MSG(tb->top->m_fb_wr_addr < Testbench::SCREEN_W * Testbench::SCREEN_H,
-                      "framebuffer write address %u out of range", tb->top->m_fb_wr_addr);
-        }
-    }
-    std::cout << "Framebuffer writes: " << fragment_count << ", last at cycle " << last_write << std::endl;
-    CHECK_MSG(fragment_count > 1000, "cube produced only %d framebuffer writes", fragment_count);
-    CHECK_MSG(last_write < 200000, "pipeline still writing near the end of the run");
+    // DONE must mean the pipeline has fully drained: nothing more is written.
+    const uint64_t writes_at_done = zbuf.fb_writes;
+    for (int i = 0; i < 2000; ++i) sim.tick();
+    CHECK_EQ(zbuf.fb_writes, writes_at_done);
+    CHECK_EQ(gpu.status() & (GPU_STATUS_BUSY | GPU_STATUS_DONE), 0u);
 
-    tb->save_framebuffer_to_ppm("render_output.ppm");
-    return tb::summarize("gpu_top", cycles, 1);
+    // A zero-vertex draw completes immediately.
+    gpu.set_vertex_buffer(kVramBase, 0);
+    gpu.start(false, true);
+    CHECK(gpu.wait_done(1000));
+    CHECK_EQ(gpu.counters().verts, 0u);
+
+    return sim.finish();
 }
