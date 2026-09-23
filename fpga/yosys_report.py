@@ -2,12 +2,15 @@
 """Open-source synthesis cross-check with sv2v + Yosys (synth_xilinx, xc7).
 
 This is NOT Vivado and gives no timing: it reports mapped cell counts
-(LUT/FF/CARRY4/DSP48E1/RAMB36E1/LUTRAM/SRL) and, as a structural proxy for
-logic depth, Yosys' `ltp -noff` (the longest combinational path counted in
-mapped cells). It is used to show that the RTL synthesises, that the
-buffers infer block RAM and the multipliers DSPs, and how logic depth
-changed versus the baseline RTL. Timing and Fmax come only from Vivado
-(fpga/build.tcl).
+(LUT/FF/CARRY4/DSP48E1/RAMB36E1/LUTRAM/SRL). It is used to show that the
+RTL synthesises, that the buffers infer block RAM and the multipliers DSPs,
+and how resource use changed versus the baseline RTL. Timing, logic depth
+and Fmax come only from Vivado (fpga/build.tcl).
+
+Logic depth is deliberately not reported: Yosys' `ltp -noff` does not treat
+mapped Xilinx flip-flops (FDRE etc.) as path breaks, so after synth_xilinx it
+measures paths straight through registers (a 50-stage register pipeline
+reports length 153). It is only meaningful before technology mapping.
 
 Run inside the gpu-synth image (docker/Dockerfile.synth):
     python3 fpga/yosys_report.py [--out fpga/reports/yosys_summary.md]
@@ -61,12 +64,9 @@ def synth(src_dir, top, files, params, work):
     run(f"sv2v --top={top} {' '.join(srcs)} > {v}")
     chparam = " ".join(f"chparam -set {k} {val} {top};" for k, val in params.items())
     script = (f"read_verilog {v}; {chparam} synth_xilinx -family xc7 -top {top} -flatten; "
-              f"tee -o {work}/stat.txt stat; tee -o {work}/ltp.txt ltp -noff")
+              f"tee -o {work}/stat.txt stat")
     run(f"yosys -q -p '{script}'", cwd=work)
-    counts = stat_counts(open(f"{work}/stat.txt").read())
-    m = re.search(r"Longest topological path in \S+ \(length=(\d+)\)", open(f"{work}/ltp.txt").read())
-    counts["ltp"] = int(m.group(1)) if m else None
-    return counts
+    return stat_counts(open(f"{work}/stat.txt").read())
 
 
 def main():
@@ -96,15 +96,14 @@ def main():
     with open(args.out, "w") as f:
         f.write("# Yosys synthesis cross-check (not Vivado)\n\n")
         f.write(f"Tool: {version}. Command: `python3 fpga/yosys_report.py` in the gpu-synth image "
-                "(docker/Dockerfile.synth). `synth_xilinx -family xc7 -flatten`, no timing. "
-                "`ltp` = longest combinational path in mapped cells (LUT, CARRY4, MUXF, DSP ...), "
-                "a structural proxy for logic depth, not a delay.\n\n")
-        f.write("| Design | LUT | FF | CARRY4 | DSP48E1 | RAMB36E1 | LUTRAM cells | SRL | ltp (cells) |\n")
-        f.write("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+                "(docker/Dockerfile.synth). `synth_xilinx -family xc7 -flatten`. Cell counts only: "
+                "no timing and no logic depth (see the script's docstring).\n\n")
+        f.write("| Design | LUT | FF | CARRY4 | DSP48E1 | RAMB36E1 | LUTRAM cells | SRL |\n")
+        f.write("|---|---:|---:|---:|---:|---:|---:|---:|\n")
         for label, c in rows:
             f.write(f"| {label} | {c['LUT']} | {c['FF']} | {c['CARRY4']} | {c['DSP48E1']} | "
                     f"{c['RAMB36E1']}{' + %d RAMB18' % c['RAMB18E1'] if c['RAMB18E1'] else ''} | "
-                    f"{c['LUTRAM']} | {c['SRL']} | {c['ltp']} |\n")
+                    f"{c['LUTRAM']} | {c['SRL']} |\n")
         full = dict(rows)["gpu_top RAST_SPAN=4 (default)"]
         f.write("\nDefault configuration as a share of the XC7Z020 (capacities from DS190: "
                 "53,200 LUTs, 106,400 FFs, 140 RAMB36, 220 DSP48E1). LUT excludes LUTs used as "

@@ -146,9 +146,9 @@ RTL's incremental and traversal logic rather than a transcription of it.
 Phase 3 fixed the input rate at one vertex per 4 cycles, the 32-bit bus limit,
 so a fully parallel 4x4 transform would sit idle 75% of the time. Computing
 one output row per cycle is the same throughput with a quarter of the
-multipliers: about 16 DSP48 instead of about 64 for 32x32 products. The DSP
-counts come from Vivado's usual 4-DSP decomposition of a 32x32 multiply, and
-the real numbers are in the Vivado report. Measured throughput: 400 vertices
+multipliers. Yosys maps the baseline module to 48 DSP48E1 and this one to
+12 (`fpga/yosys_report.py`; Vivado's own count comes from the phase 9 flow).
+Measured throughput: 400 vertices
 in 1607 cycles (4.02 cycles/vertex). The pipeline is operand select, then
 multiply, then a product register (so synthesis can pack the DSP's M and P
 registers), then pairwise sums, then the final sum. The old design did the
@@ -483,6 +483,30 @@ excluding memory LUTs); 8,870 flip-flops; 33 RAM32M (the vertex FIFO, in
 LUTRAM as intended); 299 SRL16E/SRLC32E (the divider payload shift register);
 1,169 CARRY4. This shows the RTL synthesises and infers block RAM, DSPs, LUTRAM
 and SRLs where the design intends. It is not timing and not Vivado's
-mapping. `fpga/yosys_report.py` extends it to every RAST_SPAN and to
-baseline-vs-new modules with a logic-depth proxy; that full matrix had not
-finished when this was written.
+mapping.
+
+**Scripted matrix (`fpga/yosys_report.py`, results in
+`fpga/reports/yosys_summary.md`).** It covers every RAST_SPAN and the baseline
+modules next to their replacements. It reports 10,914 LUT for the default
+design rather than 10,957: the script sets the parameter with `chparam`,
+which re-elaborates the design, and Yosys optimises slightly differently.
+Both counts are real outputs of their commands. The reproducible one is the
+script's. Highlights:
+
+| Module | Baseline | New |
+|---|---|---|
+| geom_engine | 939 LUT, 48 DSP | 361 LUT, 12 DSP |
+| persp_viewport | 40,296 LUT, 7,810 CARRY4 (three 64-bit combinational dividers) | 3,393 LUT, 18 DSP, 2,257 FF (pipelined) |
+| rasterizer | 1,977 LUT, 24 DSP | 1,830 LUT, 11 DSP, plus tri_setup at 2,521 LUT and 6 DSP |
+| pixel_map / rop | 89 LUT, no memory | 479 LUT, 76 RAMB36E1 (both buffers now on chip) |
+
+RAST_SPAN 1 / 2 / 4 / 8 costs 10,342 / 10,796 / 10,914 / 11,474 LUT and
+37 / 37 / 48 / 81 DSP48E1 for the full design. Yosys maps the rasterizer's
+k x step tables to DSPs at larger spans; Vivado may choose LUTs instead.
+
+*A tool pitfall found here:* the first version of the script also reported
+Yosys' `ltp -noff` as a logic-depth proxy. The full-design numbers
+(1,193–1,400 cells) were implausible for a pipelined design, and a check on a
+50-stage register pipeline (length 153 after `synth_xilinx`, 5 after generic
+`synth`) showed that `ltp` walks through mapped Xilinx flip-flops. The column
+was removed and not reported. Logic depth comes only from Vivado.
