@@ -23,7 +23,7 @@ TB_COMMON := $(wildcard tb/common/*.h tb/common/*.cpp sw/*.h sw/*.hpp model/*.h)
 
 TESTS := axil_regs vertex_fetch geom_engine recip_pipe persp_viewport \
          prim_assembly tri_setup rasterizer rasterizer_s1 rasterizer_s8 \
-         pixel_map gpu_top
+         rop gpu_top
 
 VFLAGS := -Wall --x-assign unique --x-initial unique -O3 \
           --build -j $(JOBS) \

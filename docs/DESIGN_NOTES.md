@@ -295,3 +295,88 @@ triangle in flight.
 triangle waits in setup's output register, the next triangle can already be
 culled. The scoreboard matches "output" to the oldest unresolved triangle
 and cull/clip pulses to the oldest one not parked in the output register.
+
+---
+
+## Phase 6: ROP, on-chip buffers, integration
+
+**Blocker fixed: the framebuffer did not fit and would have been deleted.**
+640x480 at 32 bits is 9.8 Mbit, about 300 RAMB36, but the XC7Z020 has 140.
+The old top also left the read port unconnected, so synthesis would have
+removed the RAM entirely, and the Z-buffer lived in the testbench.
+
+**Decision: 320x240, RGB565 colour and 16-bit depth, both in block RAM.**
+Capacity arithmetic (a design calculation, not a synthesis result; the
+Vivado report has the real count): each buffer is 76,800 x 16 bit =
+1,228,800 bit. A RAMB36 holds 32 Kbit of data (2K x 18 used as 16), so each
+buffer needs at least 76800 / 2048 = 37.5, i.e. 38 RAMB36, and both need 76
+of 140 (54%). Alternatives:
+
+| Option | Minimum RAMB36 | Verdict |
+|---|---:|---|
+| 640x480 RGB565 colour only (Z off chip) | 150 | does not fit |
+| 320x240 RGB888 + 24-bit Z | ~114 | fits, leaves ~26 for everything else |
+| 320x240 RGB565 + 16-bit Z | 76 | chosen: room to spare, 16-bit Z is adequate for these depth ranges |
+| 320x240 + double-buffered colour | 114 | not needed for offline rendering |
+
+320x240 is QVGA, which a display controller would scan-double to 640x480.
+The resolution is a parameter (up to 1023 px, limited by Q11.4 coordinates).
+
+**Decision: a real external read port, used by the testbench.** `fb_rd_addr ->
+fb_rd_data` has 2-cycle latency and one address per cycle. Colour reads use
+the colour RAM's dedicated read port and work at any time, which is what a
+scan-out engine needs. Depth reads share the Z RAM's read port with the
+depth test, so they are only valid while the GPU is idle (like
+`glReadPixels` of depth after `glFinish`). Every frame the regression
+checks is read through this port, with no hierarchical peeks into the RTL,
+and the port also keeps synthesis from optimising the RAMs away.
+
+**Decision: fully pipelined depth test with 3-entry forwarding, not stalls.**
+The old `pixel_map` took 3 cycles per fragment. The ROP now accepts one per
+cycle: address, then RAM read, then compare, then registered write. That
+opens a read-after-write hazard. A fragment that reads a pixel within 3
+cycles of an earlier fragment's write to the same pixel would see stale
+depth, and that happens constantly along shared edges and in small
+triangles. Two options:
+
+- *Stall* on an address match: simple, but costs up to 3 cycles per hazard.
+- *Forward* (chosen): compare the address with the writes decided in each of
+  the last 3 cycles and take the newest match. It costs three 17-bit
+  comparators and a mux.
+
+The history is indexed by cycle, not by fragment, so bubbles do not break it.
+The unit test streams fragments at 1–6 distinct pixels with random bubbles
+and ties, which hits every forwarding distance, and it checks both buffers
+against a sequential reference. Measured: 76,800 fragments accepted in
+76,800 cycles.
+
+*Why the extra register before the RAM read:* a 76,800-deep buffer is 38
+BRAM36 primitives, so the read address fans out to all of them. Computing
+`y*320 + x` and driving that fan-out in the same cycle would put an
+adder chain in front of a high-fan-out net. Registering it costs one cycle of
+latency, and the forwarding depth is unchanged (it depends only on the
+read-to-write distance).
+
+**Decision: a hardware clear engine, one pixel per cycle.** It writes the
+clear colour and depth 0xFFFF through the same registered write port, and
+its writes enter the forwarding history too. *Cost, measured:* 76,801 cycles,
+which is most of the frame time for a simple scene (the full cube command is
+100,294 cycles, clear included). This is the first thing I'd optimise next:
+wider RAM words (2 or 4 pixels per write), or a per-tile "cleared" bit so the
+clear becomes free and the first depth test in each tile reads the clear
+value.
+
+**Decision: DONE requires every stage to be idle, with exact idle signals.**
+Each stage's `idle` covers its own registers, including the ROP's pending
+write, so one idle cycle after fetch completes means every write has
+committed. The system test checks that no framebuffer change and no
+BUSY/DONE change happens after DONE.
+
+**System test (all through the driver, frames read back through the port):**
+clear only; 10 CLEAR+DRAW scenes (single triangle, interpenetrating
+triangles, culled cube, clipping corner cases, 6 random scenes); a second
+DRAW accumulating without CLEAR; random memory latency/back-pressure with a
+jittered register bus (the frames must be identical); a command written while
+busy (ignored); the IRQ pin; a bus error mid-draw (FETCH_ERR, abandoned
+draw, clean recovery); and a partial trailing triangle. Every frame and
+every counter matches the golden model exactly.

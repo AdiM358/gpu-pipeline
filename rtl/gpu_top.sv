@@ -1,11 +1,18 @@
 `default_nettype none
 
-// GPU top level (interim: new front end and rasterizer, baseline pixel_map
-// and external Z-buffer until the ROP lands).
+// GPU top level.
+//
+//   AXI-Lite regs -> gpu_ctrl
+//   vertex_fetch -> geom_engine -> persp_viewport -> prim_assembly
+//     -> tri_setup -> rasterizer -> rop (depth test, colour + depth buffers)
+//
+// The colour and depth buffers are on chip (SCREEN_W x SCREEN_H x 16 bit
+// each) and readable through the fb_rd_* port (2-cycle latency).
 module gpu_top #(
-    parameter int SCREEN_W  = 640,
-    parameter int SCREEN_H  = 480,
-    parameter int RAST_SPAN = 4
+    parameter int SCREEN_W  = 320,
+    parameter int SCREEN_H  = 240,
+    parameter int RAST_SPAN = 4,
+    localparam int FB_AW    = $clog2(SCREEN_W * SCREEN_H)
 )(
     input  wire         clk,
     input  wire         rst_n,
@@ -43,29 +50,19 @@ module gpu_top #(
     input  wire         m_axi_rvalid,
     output logic        m_axi_rready,
 
-    // Baseline external Z-buffer and framebuffer write ports
-    output logic [31:0]        m_zbuf_rd_addr,
-    output logic               m_zbuf_rd_en,
-    input  wire  [31:0]        s_zbuf_rd_data,
-    output logic [31:0]        m_zbuf_wr_addr,
-    output logic signed [31:0] m_zbuf_wr_data,
-    output logic               m_zbuf_wr_en,
-    output logic [31:0]        m_fb_wr_addr,
-    output logic [31:0]        m_fb_wr_data,
-    output logic               m_fb_wr_en
+    // Framebuffer read port (scan-out / readback), 2-cycle latency.
+    // fb_rd_depth selects the depth buffer (valid only while not busy).
+    input  wire  [FB_AW-1:0] fb_rd_addr,
+    input  wire              fb_rd_depth,
+    output logic [15:0]      fb_rd_data
 );
 
     // ================================================================ control
     logic        cmd_draw, cmd_clear, cmd_start, done_set, busy;
-    logic        start_draw;
-    /* verilator lint_off UNUSEDSIGNAL */
-    logic        start_clear;    // drives the clear engine (ROP, next phase)
-    /* verilator lint_on UNUSEDSIGNAL */
+    logic        start_draw, start_clear, clear_busy;
     logic [31:0] vbuf_base, vertex_count;
     logic        cull_back, front_cw;
-    /* verilator lint_off UNUSEDSIGNAL */
-    logic [15:0] clear_color;    // used by the clear engine (ROP, next phase)
-    /* verilator lint_on UNUSEDSIGNAL */
+    logic [15:0] clear_color;
     logic signed [31:0] mvp [4][4];
     logic [31:0] perf [8];
     logic        fetch_busy, fetch_err;
@@ -84,10 +81,12 @@ module gpu_top #(
         .busy, .done_set, .err_set(fetch_err), .perf
     );
 
-    gpu_ctrl #(.DRAIN_CYCLES(4)) u_ctrl (
+    // Every stage's idle output is exact (it covers the stage's own
+    // registers), so a single idle cycle after fetch finishes is enough.
+    gpu_ctrl #(.DRAIN_CYCLES(1)) u_ctrl (
         .clk, .rst_n,
         .cmd_draw, .cmd_clear,
-        .start_clear, .clear_busy(1'b0),
+        .start_clear, .clear_busy,
         .start_draw, .fetch_busy, .pipe_idle,
         .busy, .cmd_start, .done_set
     );
@@ -183,24 +182,25 @@ module gpu_top #(
         .busy(rast_busy), .idle(rast_idle)
     );
 
-    // ================================================================ back end (baseline)
-    pixel_map #(.SCREEN_W(SCREEN_W), .SCREEN_H(SCREEN_H)) u_pixel_map (
+    // ================================================================ back end
+    logic rop_idle, frag_pass;
+
+    rop #(.SCREEN_W(SCREEN_W), .SCREEN_H(SCREEN_H)) u_rop (
         .clk, .rst_n,
-        .s_frag_x({6'd0, fr_x}), .s_frag_y({6'd0, fr_y}), .s_frag_z({16'd0, fr_z}),
-        .s_frag_color({8'd0, fr_r, fr_g, fr_b}),
-        .s_frag_valid(fr_valid), .s_frag_ready(fr_ready),
-        .m_zbuf_rd_addr, .m_zbuf_rd_en, .s_zbuf_rd_data,
-        .m_zbuf_wr_addr, .m_zbuf_wr_data, .m_zbuf_wr_en,
-        .m_fb_wr_addr, .m_fb_wr_data, .m_fb_wr_en
+        .in_x(fr_x), .in_y(fr_y), .in_z(fr_z), .in_r(fr_r), .in_g(fr_g), .in_b(fr_b),
+        .in_valid(fr_valid), .in_ready(fr_ready),
+        .start_clear, .clear_color, .clear_busy,
+        .ext_addr(fb_rd_addr), .ext_depth(fb_rd_depth), .ext_data(fb_rd_data),
+        .frag_pass, .idle(rop_idle)
     );
 
     // ================================================================ status
-    assign pipe_idle = geom_idle && persp_idle && prim_idle && setup_idle && rast_idle && fr_ready;
+    assign pipe_idle = geom_idle && persp_idle && prim_idle && setup_idle && rast_idle && rop_idle;
 
     // Performance counters (order matches GPU_REG_PERF_* in sw/gpu_regs.h)
     wire [7:0] perf_inc = {
         rast_busy,               // 7 rasterizer busy cycles
-        m_fb_wr_en,              // 6 fragments passing the depth test
+        frag_pass,               // 6 fragments passing the depth test
         fr_valid && fr_ready,    // 5 fragments generated
         tri_clipped,             // 4 triangles rejected
         tri_culled,              // 3 triangles culled
@@ -219,16 +219,6 @@ module gpu_top #(
             end
         end
     end
-
-    // The baseline framebuffer stays for one more phase (read port unused).
-    framebuffer #(.SCREEN_W(SCREEN_W), .SCREEN_H(SCREEN_H), .DATA_WIDTH(32)) u_framebuffer (
-        .clk,
-        .s_wr_addr(m_fb_wr_addr), .s_wr_data(m_fb_wr_data), .s_wr_en(m_fb_wr_en),
-        .s_rd_addr(32'b0),
-        /* verilator lint_off PINCONNECTEMPTY */
-        .m_rd_data()
-        /* verilator lint_on PINCONNECTEMPTY */
-    );
 
 endmodule
 
