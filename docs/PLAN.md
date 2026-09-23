@@ -66,7 +66,7 @@ Every phase ends with the full regression green, a commit, and a DESIGN_NOTES en
 | 2 | `axil_regs`: spec-compliant AXI-Lite (independent AW/W, WSTRB, reads, back-pressure), register map with STATUS/W1C, perf counters, `docs/REGMAP.md`, `sw/gpu_regs.h`, C++ driver used by the testbench | done |
 | 3 | `vertex_fetch` rewrite: 16 B vertices, bursts, prefetch FIFO, credits, rresp/rlast, randomised-latency memory model | done |
 | 4 | C++ golden model (per-stage functions plus a full `render()`); `geom_engine` rate-matched and pipelined; `recip_pipe` and new `persp_viewport` with outcode/near/guard-band flags; unit tests compare bit-exactly against the model with random stimulus and back-pressure | done |
-| 5 | `tri_setup` (cull, reject, gradients) and new `rasterizer` (Z, Gouraud, fill rule, span); unit tests compare fragment sets to the model | planned |
+| 5 | `tri_setup` (cull, reject, gradients) and new `rasterizer` (Z, Gouraud, fill rule, span); unit tests compare fragment sets to the model | done |
 | 6 | `rop` with forwarding and clear, `sdp_ram`, external read port; switch `gpu_top` to the new datapath; delete old modules; system scene tests compare pixel-for-pixel and counter-for-counter to the model | planned |
 | 7 | Coverage (`make coverage`, per-module report, tests for uncovered branches) and GitHub Actions | planned |
 | 8 | Performance: `RAST_SPAN` sweep, old-vs-new unit benches built from the `baseline` tag, rotating-cube demo, PPM to GIF | planned |

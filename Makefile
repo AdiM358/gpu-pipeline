@@ -22,7 +22,8 @@ MODEL_SRC := $(abspath model/gpu_model.cpp)
 TB_COMMON := $(wildcard tb/common/*.h tb/common/*.cpp sw/*.h sw/*.hpp model/*.h) $(MODEL_SRC)
 
 TESTS := axil_regs vertex_fetch geom_engine recip_pipe persp_viewport \
-         prim_assembly rasterizer pixel_map gpu_top
+         prim_assembly tri_setup rasterizer rasterizer_s1 rasterizer_s8 \
+         pixel_map gpu_top
 
 VFLAGS := -Wall --x-assign unique --x-initial unique -O3 \
           --build -j $(JOBS) \
@@ -38,6 +39,13 @@ RUN_ARGS := +seed=$(SEED) +verilator+seed+$(SEED)
 
 # Per-test overrides
 vflags_recip_pipe := -GPAY_W=32
+# The rasterizer is verified at several span widths (default SPAN=4).
+top_rasterizer_s1   := rasterizer
+src_rasterizer_s1   := tb/rasterizer_tb.cpp
+vflags_rasterizer_s1 := -GSPAN=1
+top_rasterizer_s8   := rasterizer
+src_rasterizer_s8   := tb/rasterizer_tb.cpp
+vflags_rasterizer_s8 := -GSPAN=8
 
 .PHONY: all clean lint $(addprefix test-,$(TESTS))
 
