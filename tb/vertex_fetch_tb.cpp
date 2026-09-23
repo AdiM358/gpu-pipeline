@@ -1,219 +1,187 @@
-#include <iostream>
-#include "sim.h"
-#include <memory>
-#include <vector>
-#include <verilated.h>
-#include <verilated_vcd_c.h>
+// vertex_fetch: ordering/completeness scoreboard under random memory timing
+// and back-pressure, 4 KB burst splitting, error handling, prefetch overlap.
+#include <deque>
+
 #include "Vvertex_fetch.h"
+#include "axi_mem.h"
+#include "sim.h"
 
-// Struct matching 32-byte (8x32-bit word) memory vertex layout
-struct Vertex {
-    int32_t x;
-    int32_t y;
-    int32_t z;
-    uint32_t color;
-    uint32_t reserved[4]; // Remaining 4 words (u, v, normals, etc.)
+using Dut = Vvertex_fetch;
+
+namespace {
+
+constexpr uint32_t kBase = 0x1000'0000;
+constexpr uint32_t kMemBytes = 64 * 1024;
+
+struct Vtx {
+    uint32_t x, y, z, c;
+    bool operator==(const Vtx& o) const { return x == o.x && y == o.y && z == o.z && c == o.c; }
 };
 
-struct Testbench {
-    std::unique_ptr<Vvertex_fetch> top;
-    std::unique_ptr<VerilatedVcdC> trace;
-    uint64_t main_time = 0;
-
-    // Simulated VRAM (Direct Memory Model)
-    std::vector<uint32_t> vram;
-    static constexpr uint32_t VRAM_BASE_ADDR = 0x80000000;
-
-    // Internal memory transfer tracking state
-    uint32_t active_araddr = 0;
-    uint8_t active_arlen = 0;
-    uint8_t burst_counter = 0;
-    bool burst_in_progress = false;
-
-    Testbench() {
-        top = std::make_unique<Vvertex_fetch>();
-#if VM_TRACE
-        Verilated::traceEverOn(true);
-        trace = std::make_unique<VerilatedVcdC>();
-        top->trace(trace.get(), 99);
-        trace->open("waveform.vcd");
-#endif
-        
-        // Allocate 1 KB simulated VRAM space
-        vram.resize(256, 0);
-    }
-
-    ~Testbench() {
-#if VM_TRACE
-        if (trace) trace->close();
-#endif
-    }
-
-    void tick() {
-        top->clk = !top->clk;
-        top->eval();
-#if VM_TRACE
-        if (trace) trace->dump(main_time);
-#endif
-        main_time++;
-    }
-
-    void clock_cycle() {
-        top->clk = 0;
-        tick();
-        top->clk = 1;
-
-        // Model VRAM reacting to AXI Read Requests
-        service_axi_memory_requests();
-
-        tick();
-    }
-
-    void reset() {
-        top->rst_n = 0;
-        top->start_pulse = 0;
-        top->vbuf_base_addr = 0;
-        top->vertex_count = 0;
-        top->m_axi_arready = 0;
-        top->m_axi_rvalid = 0;
-        top->m_axi_rdata = 0;
-        top->m_axi_rlast = 0;
-        top->stream_ready = 0;
-
-        for (int i = 0; i < 5; i++) {
-            clock_cycle();
+// Consumes the vertex stream with random back-pressure and compares every
+// vertex against the expected sequence.
+struct Sink : tb::Agent {
+    tb::Sim<Dut>& sim;
+    Dut& d;
+    std::deque<Vtx> expected;
+    uint64_t received = 0, unexpected = 0;
+    int ready_pct = 100;
+    explicit Sink(tb::Sim<Dut>& s) : sim(s), d(*s.dut) {}
+    void observe() override {
+        if (!d.rst_n || !(d.out_valid && d.out_ready)) return;
+        const Vtx got{d.out_x, d.out_y, d.out_z, d.out_color};
+        if (expected.empty()) {
+            ++unexpected;
+            return;
         }
-        top->rst_n = 1;
-        clock_cycle();
-        std::cout << "Reset complete." << std::endl;
+        CHECK_MSG(got == expected.front(), "vertex %llu mismatch: got (%08x %08x %08x %08x)",
+                  (unsigned long long)received, got.x, got.y, got.z, got.c);
+        expected.pop_front();
+        ++received;
     }
+    void drive() override { d.out_ready = sim.chance(ready_pct); }
+};
 
-    // Write a vertex directly into simulated VRAM array
-    void load_vertex_into_vram(uint32_t address, const Vertex& v) {
-        uint32_t word_offset = (address - VRAM_BASE_ADDR) / 4;
-        
-        vram[word_offset + 0] = static_cast<uint32_t>(v.x);
-        vram[word_offset + 1] = static_cast<uint32_t>(v.y);
-        vram[word_offset + 2] = static_cast<uint32_t>(v.z);
-        vram[word_offset + 3] = v.color;
-        for (int i = 0; i < 4; i++) {
-            vram[word_offset + 4 + i] = v.reserved[i];
-        }
-    }
-
-    // Behavioral AXI4 Memory Slave responding to vertex_fetch master
-    void service_axi_memory_requests() {
-        // Handle Read Address Channel (AR) Handshake
-        if (top->m_axi_arvalid && !burst_in_progress) {
-            top->m_axi_arready = 1;
-            active_araddr = top->m_axi_araddr;
-            active_arlen = top->m_axi_arlen;
-            burst_counter = 0;
-            burst_in_progress = true;
-        } else {
-            top->m_axi_arready = 0;
-        }
-
-        // Handle Read Data Channel (R) Streaming
-        if (burst_in_progress && top->m_axi_rready) {
-            uint32_t word_offset = (active_araddr - VRAM_BASE_ADDR) / 4 + burst_counter;
-            
-            top->m_axi_rdata = vram[word_offset];
-            top->m_axi_rvalid = 1;
-            top->m_axi_rlast = (burst_counter == active_arlen) ? 1 : 0;
-
-            if (top->m_axi_rvalid && top->m_axi_rready) {
-                burst_counter++;
-                if (burst_counter > active_arlen) {
-                    burst_in_progress = false;
-                }
-            }
-        } else if (!burst_in_progress) {
-            top->m_axi_rvalid = 0;
-            top->m_axi_rlast = 0;
-        }
+// Counts error_set pulses.
+struct ErrMon : tb::Agent {
+    Dut& d;
+    int pulses = 0;
+    explicit ErrMon(Dut& dut) : d(dut) {}
+    void observe() override {
+        if (d.rst_n && d.error_set) ++pulses;
     }
 };
+
+Vtx vertex_at(tb::AxiMem<Dut>& mem, uint32_t addr) {
+    return {mem.read32(addr), mem.read32(addr + 4), mem.read32(addr + 8), mem.read32(addr + 12)};
+}
+
+// Starts a job and runs until busy falls. Returns cycles taken.
+uint64_t run_job(tb::Sim<Dut>& sim, uint32_t base, uint32_t count, uint64_t timeout = 200000) {
+    Dut& d = *sim.dut;
+    d.base_addr = base;
+    d.vertex_count = count;
+    d.start = 1;
+    sim.tick();
+    d.start = 0;
+    const uint64_t t0 = sim.cycle;
+    while (d.busy) {
+        sim.tick();
+        if (sim.cycle - t0 > timeout) FATAL("job at 0x%08x (%u vertices) did not finish", base, count);
+    }
+    return sim.cycle - t0;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
-    auto tb = std::make_unique<Testbench>();
+    tb::Sim<Dut> sim(argc, argv, "vertex_fetch");
+    Dut& d = *sim.dut;
+    tb::AxiMem<Dut> mem(sim, kBase, kMemBytes);
+    Sink sink(sim);
+    ErrMon errmon(d);
+    sim.add_agent(&mem);
+    sim.add_agent(&sink);
+    sim.add_agent(&errmon);
 
-    tb->reset();
+    for (uint32_t a = kBase; a < kBase + kMemBytes; a += 4) mem.write32(a, sim.rand_u32());
+    mem.reset_signals();
+    d.start = 0;
+    d.out_ready = 1;
+    sim.reset();
+    CHECK_EQ(d.busy, 0);
 
-    // 1. Setup Test Vertices in VRAM
-    Vertex v0 = {0x00010000, 0x00020000, 0x00030000, 0xFF0000FF, {0}}; // X=1.0, Y=2.0, Z=3.0, Red
-    Vertex v1 = {static_cast<int32_t>(0xFFFF0000), 0x00008000, 0x00000000, 0x00FF00FF, {0}}; // X=-1.0, Y=0.5, Z=0.0, Green
+    auto expect_range = [&](uint32_t base, uint32_t count) {
+        for (uint32_t i = 0; i < count; ++i) sink.expected.push_back(vertex_at(mem, base + 16 * i));
+    };
 
-    tb->load_vertex_into_vram(Testbench::VRAM_BASE_ADDR + 0, v0);
-    tb->load_vertex_into_vram(Testbench::VRAM_BASE_ADDR + 32, v1);
+    // ---- zero-length job: never busy for more than the start cycle
+    run_job(sim, kBase, 0);
+    CHECK_EQ(mem.bursts, 0u);
 
-    // 2. Configure Fetch Unit and Trigger Start Pulse
-    tb->top->vbuf_base_addr = Testbench::VRAM_BASE_ADDR;
-    tb->top->vertex_count = 2;
-    tb->top->start_pulse = 1;
-    
-    tb->clock_cycle();
-    tb->top->start_pulse = 0; // Self-clear pulse
+    // ---- ideal memory: throughput is bus-limited at 4 cycles per vertex
+    expect_range(kBase, 256);
+    const uint64_t t_ideal = run_job(sim, kBase, 256);
+    CHECK(sink.expected.empty());
+    std::printf("  256 vertices, ideal memory:        %llu cycles (%.2f cycles/vertex)\n",
+                (unsigned long long)t_ideal, t_ideal / 256.0);
+    CHECK_MSG(t_ideal <= 4 * 256 + 16, "ideal-memory fetch took %llu cycles", (unsigned long long)t_ideal);
 
-    // Assert fetch engine transitioned to busy
-    CHECK_MSG(tb->top->busy == 1, "fetch engine failed to enter busy state");
+    // ---- 32-cycle read latency: prefetch keeps several bursts in flight
+    mem.latency = 32;
+    mem.peak_outstanding = 0;
+    expect_range(kBase, 256);
+    const uint64_t t_lat = run_job(sim, kBase, 256);
+    CHECK(sink.expected.empty());
+    std::printf("  256 vertices, 32-cycle latency:    %llu cycles (%.2f cycles/vertex), peak %zu bursts in flight\n",
+                (unsigned long long)t_lat, t_lat / 256.0, mem.peak_outstanding);
+    CHECK_MSG(mem.peak_outstanding >= 3, "prefetch not overlapping bursts (peak %zu)", mem.peak_outstanding);
+    CHECK_MSG(t_lat <= 4 * 256 + 64, "latency not hidden: %llu cycles", (unsigned long long)t_lat);
+    mem.latency = 0;
 
-    // Enable downstream stream receiver (Geometry Engine ready)
-    tb->top->stream_ready = 1;
+    // ---- bursts are split at 4 KB boundaries (AxiMem checks every burst)
+    const uint32_t near_4k = kBase + 0x1000 - 16 * 2;  // 2 vertices before the boundary
+    expect_range(near_4k, 11);
+    const uint64_t bursts_before = mem.bursts;
+    run_job(sim, near_4k, 11);
+    CHECK(sink.expected.empty());
+    CHECK_EQ(mem.bursts - bursts_before, 4u);  // 2 | 4 | 4 | 1
 
-    // 3. Verify Vertex 0 Stream Output
-    int timeout = 0;
-    while (!tb->top->stream_valid) {
-        tb->clock_cycle();
-        timeout++;
-        if (!(timeout < 100)) FATAL("Timeout waiting for Vertex 0 stream_valid");
+    // ---- random jobs under random timing and back-pressure
+    for (int job = 0; job < 60; ++job) {
+        mem.ar_ready_pct = sim.rand_range(20, 100);
+        mem.r_valid_pct = sim.rand_range(20, 100);
+        mem.latency = sim.rand_range(0, 20);
+        sink.ready_pct = sim.rand_range(10, 100);
+        const uint32_t count = sim.chance(10) ? sim.rand_range(0, 3) : sim.rand_range(1, 400);
+        const uint32_t base = kBase + 16 * sim.rand_range(0, (kMemBytes - 16 * 400) / 16 - 1);
+        expect_range(base, count);
+        run_job(sim, base, count);
+        CHECK_MSG(sink.expected.empty(), "job %d: %zu vertices missing", job, sink.expected.size());
+        sink.expected.clear();
+        CHECK(mem.idle());
+    }
+    CHECK_EQ(sink.unexpected, 0u);
+    CHECK_EQ(errmon.pulses, 0);
+    mem.ar_ready_pct = mem.r_valid_pct = sink.ready_pct = 100;
+    mem.latency = 0;
+
+    // ---- SLVERR mid-job: one error pulse, output is a prefix, bus drains
+    {
+        const uint32_t base = kBase + 0x2000, count = 100;
+        mem.err_lo = base + 16 * 37 + 8;  // z word of vertex 37
+        mem.err_hi = mem.err_lo + 4;
+        sink.ready_pct = 50;
+        const uint64_t before = sink.received;
+        expect_range(base, count);
+        run_job(sim, base, count);
+        const uint64_t got = sink.received - before;
+        CHECK_EQ(errmon.pulses, 1);
+        CHECK_MSG(got <= 37, "%llu vertices delivered, vertex 37 or later leaked past the error",
+                  (unsigned long long)got);
+        CHECK(mem.idle());
+        sink.expected.clear();
+        mem.err_lo = mem.err_hi = 0;
+        sink.ready_pct = 100;
     }
 
-    std::cout << "Stream received Vertex 0: X=0x" << std::hex << tb->top->stream_vx 
-              << " Y=0x" << tb->top->stream_vy 
-              << " Z=0x" << tb->top->stream_vz 
-              << " Color=0x" << tb->top->stream_color << std::dec << std::endl;
-
-    CHECK_MSG(tb->top->stream_vx == v0.x, "v0 X mismatch");
-    CHECK_MSG(tb->top->stream_vy == v0.y, "v0 Y mismatch");
-    CHECK_MSG(tb->top->stream_vz == v0.z, "v0 Z mismatch");
-    CHECK_MSG(tb->top->stream_color == v0.color, "v0 Color mismatch");
-
-    tb->clock_cycle(); // Handshake completes
-
-    // 4. Verify Vertex 1 Stream Output
-    timeout = 0;
-    while (!tb->top->stream_valid) {
-        tb->clock_cycle();
-        timeout++;
-        if (!(timeout < 100)) FATAL("Timeout waiting for Vertex 1 stream_valid");
+    // ---- RLAST on the wrong beat is a protocol error too
+    {
+        mem.bad_rlast_burst = static_cast<int>(mem.bursts) + 2;  // third burst of the job
+        expect_range(kBase, 64);
+        run_job(sim, kBase, 64);
+        CHECK_EQ(errmon.pulses, 2);
+        CHECK(mem.idle());
+        sink.expected.clear();
+        mem.bad_rlast_burst = -1;
     }
 
-    std::cout << "Stream received Vertex 1: X=0x" << std::hex << tb->top->stream_vx 
-              << " Y=0x" << tb->top->stream_vy 
-              << " Z=0x" << tb->top->stream_vz 
-              << " Color=0x" << tb->top->stream_color << std::dec << std::endl;
+    // ---- a clean job after errors works normally
+    expect_range(kBase + 0x3000, 50);
+    run_job(sim, kBase + 0x3000, 50);
+    CHECK(sink.expected.empty());
+    CHECK_EQ(errmon.pulses, 2);
+    CHECK_EQ(sink.unexpected, 0u);
 
-    CHECK_MSG(tb->top->stream_vx == v1.x, "v1 X mismatch");
-    CHECK_MSG(tb->top->stream_vy == v1.y, "v1 Y mismatch");
-    CHECK_MSG(tb->top->stream_vz == v1.z, "v1 Z mismatch");
-    CHECK_MSG(tb->top->stream_color == v1.color, "v1 Color mismatch");
-
-    tb->clock_cycle(); // Handshake completes
-
-    // 5. Verify Done Pulse and Idle Transition
-    timeout = 0;
-    while (!tb->top->done_pulse) {
-        tb->clock_cycle();
-        timeout++;
-        if (!(timeout < 50)) FATAL("Timeout waiting for done_pulse");
-    }
-
-    CHECK_MSG(tb->top->done_pulse == 1, "done_pulse missing");
-
-    tb->clock_cycle();
-    CHECK_MSG(tb->top->busy == 0, "fetch engine failed to return to IDLE");
-
-    return tb::summarize("vertex_fetch", tb->main_time / 2, 1);
+    return sim.finish();
 }

@@ -45,7 +45,7 @@ void push_tri(tb::AxiMem<Dut>& mem, uint32_t& addr, const double v[9], uint32_t 
         mem.write32(addr + 4, gpu::to_q16(v[3 * i + 1]));
         mem.write32(addr + 8, gpu::to_q16(v[3 * i + 2]));
         mem.write32(addr + 12, color);
-        addr += 32;  // baseline vertex stride
+        addr += 16;
     }
 }
 

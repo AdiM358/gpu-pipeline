@@ -69,10 +69,9 @@ module gpu_top #(
     /* verilator lint_off UNUSEDSIGNAL */
     logic        cull_back_en, front_cw;   // consumed once triangle setup exists
     logic [15:0] clear_color;
-    logic        fetch_done_pulse;
     logic        start_clear;              // no clear engine in the baseline datapath
     /* verilator lint_on UNUSEDSIGNAL */
-    logic        fetch_busy;
+    logic        fetch_busy, fetch_err;
     logic signed [31:0] mvp_matrix [4][4];
     logic [31:0] perf [8];
 
@@ -158,7 +157,7 @@ module gpu_top #(
         .irq           (irq),
         .busy          (busy),
         .done_set      (done_set),
-        .err_set       (1'b0),
+        .err_set       (fetch_err),
         .perf          (perf)
     );
 
@@ -211,17 +210,14 @@ module gpu_top #(
     end
 
     // Vertex Fetch Unit
-    vertex_fetch #(
-        .AXI_ADDR_WIDTH (AXI_ADDR_WIDTH),
-        .AXI_DATA_WIDTH (AXI_DATA_WIDTH)
-    ) u_vertex_fetch (
+    vertex_fetch u_vertex_fetch (
         .clk              (clk),
         .rst_n            (rst_n),
-        .start_pulse      (start_pulse),
-        .vbuf_base_addr   (vbuf_base_addr),
+        .start            (start_pulse),
+        .base_addr        (vbuf_base_addr),
         .vertex_count     (vertex_count),
         .busy             (fetch_busy),
-        .done_pulse       (fetch_done_pulse),
+        .error_set        (fetch_err),
         .m_axi_araddr     (m_axi_araddr),
         .m_axi_arlen      (m_axi_arlen),
         .m_axi_arsize     (m_axi_arsize),
@@ -233,12 +229,12 @@ module gpu_top #(
         .m_axi_rlast      (m_axi_rlast),
         .m_axi_rvalid     (m_axi_rvalid),
         .m_axi_rready     (m_axi_rready),
-        .stream_vx        (fetch_vx),
-        .stream_vy        (fetch_vy),
-        .stream_vz        (fetch_vz),
-        .stream_color     (fetch_color),
-        .stream_valid     (fetch_valid),
-        .stream_ready     (fetch_ready)
+        .out_x            (fetch_vx),
+        .out_y            (fetch_vy),
+        .out_z            (fetch_vz),
+        .out_color        (fetch_color),
+        .out_valid        (fetch_valid),
+        .out_ready        (fetch_ready)
     );
 
     // Geometry Engine

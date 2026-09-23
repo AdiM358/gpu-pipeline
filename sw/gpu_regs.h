@@ -52,6 +52,14 @@
 
 #define GPU_ID_VALUE          0x47505531u /* "GPU1" */
 
+/* Vertex buffer layout: 16 bytes per vertex, 3 consecutive vertices per
+ * triangle (triangle list). Positions are Q16.16 model-space coordinates;
+ * colour is 0x00RRGGBB and is interpolated across the triangle. */
+typedef struct {
+    int32_t  x, y, z;
+    uint32_t color;
+} gpu_vertex_t;
+
 /* Fixed-point helpers */
 #define GPU_Q16_ONE           0x00010000
 static inline uint16_t gpu_rgb565(uint8_t r, uint8_t g, uint8_t b) {

@@ -64,7 +64,7 @@ Every phase ends with the full regression green, a commit, and a DESIGN_NOTES en
 | 0 | Plan (this file), `baseline` tag | done |
 | 1 | Build/test infrastructure: generic Makefile (`make all` runs every test and fails on any failure), shared self-checking harness (no `assert`, which `-DNDEBUG` would disable), all existing tests converted to real checks, Docker image, stray PPMs removed | done |
 | 2 | `axil_regs`: spec-compliant AXI-Lite (independent AW/W, WSTRB, reads, back-pressure), register map with STATUS/W1C, perf counters, `docs/REGMAP.md`, `sw/gpu_regs.h`, C++ driver used by the testbench | done |
-| 3 | `vertex_fetch` rewrite: 16 B vertices, bursts, prefetch FIFO, credits, rresp/rlast, randomised-latency memory model | planned |
+| 3 | `vertex_fetch` rewrite: 16 B vertices, bursts, prefetch FIFO, credits, rresp/rlast, randomised-latency memory model | done |
 | 4 | C++ golden model (per-stage functions plus a full `render()`); `geom_engine` rate-matched and pipelined; `recip_pipe` and new `persp_viewport` with outcode/near/guard-band flags; unit tests compare bit-exactly against the model with random stimulus and back-pressure | planned |
 | 5 | `tri_setup` (cull, reject, gradients) and new `rasterizer` (Z, Gouraud, fill rule, span); unit tests compare fragment sets to the model | planned |
 | 6 | `rop` with forwarding and clear, `sdp_ram`, external read port; switch `gpu_top` to the new datapath; delete old modules; system scene tests compare pixel-for-pixel and counter-for-counter to the model | planned |

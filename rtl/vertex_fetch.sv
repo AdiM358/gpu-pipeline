@@ -1,159 +1,217 @@
+`default_nettype none
+
+// Vertex fetch: AXI4 burst reader with credit-based prefetch.
+//
+// Vertex format (16 bytes, little-endian words): x, y, z (Q16.16), color
+// (0x00RRGGBB). Every fetched byte is used.
+//
+// Read requests are issued ahead of consumption: a burst of up to
+// BURST_VERTS vertices is issued whenever the vertex FIFO has room for it
+// counting data already in flight ("credits"). So the FIFO can never
+// overflow and RREADY can stay high, and up to MAX_BURSTS bursts overlap
+// memory latency with streaming. Bursts are split so they never cross a
+// 4 KB boundary (an AXI rule).
+//
+// Errors: a non-OKAY RRESP or an RLAST that disagrees with the requested
+// burst length raises error_set once, stops new requests, discards buffered
+// and incoming vertices, and ends the job once all outstanding bursts have
+// drained (so the bus is left clean for the next job).
 module vertex_fetch #(
-    parameter integer AXI_ADDR_WIDTH = 32,
-    parameter integer AXI_DATA_WIDTH = 32
+    parameter int BURST_VERTS = 4,    // 16 beats
+    parameter int FIFO_VERTS  = 16,
+    parameter int MAX_BURSTS  = 4
 )(
-    // Clock & Reset
-    input wire clk,
-    input wire rst_n,
+    input  wire                clk,
+    input  wire                rst_n,
 
-    // Control Register File Interface (Inputs from AXI-Lite Slave)
-    input wire start_pulse,
-    input wire [AXI_ADDR_WIDTH-1:0] vbuf_base_addr,
-    input wire [31:0] vertex_count,
-    output logic busy,
-    output logic done_pulse,
+    // Job control
+    input  wire                start,
+    input  wire  [31:0]        base_addr,      // 16-byte aligned
+    input  wire  [31:0]        vertex_count,
+    output logic               busy,
+    output logic               error_set,      // pulse on first error of a job
 
-    // AXI4 Master Read Address Channel (AR)
-    output logic [AXI_ADDR_WIDTH-1:0] m_axi_araddr,
-    output logic [7:0] m_axi_arlen,       // Burst length - 1
-    output logic [2:0] m_axi_arsize,      // Bytes per transfer (2 = 4 bytes)
-    output logic [1:0] m_axi_arburst,     // Burst type (01 = INCR)
-    output logic m_axi_arvalid,
-    input wire m_axi_arready,
+    // AXI4 read master (AR + R channels)
+    output logic [31:0]        m_axi_araddr,
+    output logic [7:0]         m_axi_arlen,
+    output logic [2:0]         m_axi_arsize,
+    output logic [1:0]         m_axi_arburst,
+    output logic               m_axi_arvalid,
+    input  wire                m_axi_arready,
+    input  wire  [31:0]        m_axi_rdata,
+    input  wire  [1:0]         m_axi_rresp,
+    input  wire                m_axi_rlast,
+    input  wire                m_axi_rvalid,
+    output logic               m_axi_rready,
 
-    // AXI4 Master Read Data Channel (R)
-    input wire [AXI_DATA_WIDTH-1:0] m_axi_rdata,
-    /* verilator lint_off UNUSEDSIGNAL */
-    input wire [1:0] m_axi_rresp,
-    /* verilator lint_off UNUSEDSIGNAL */
-    input wire m_axi_rlast,
-    input wire m_axi_rvalid,
-    output logic m_axi_rready,
-
-    // Stream Output to Geometry Engine / Matrix Multiplier
-    output logic signed [31:0] stream_vx,
-    output logic signed [31:0] stream_vy,
-    output logic signed [31:0] stream_vz,
-    output logic [31:0] stream_color,
-    output logic stream_valid,
-    input wire stream_ready
+    // Vertex stream out
+    output logic signed [31:0] out_x,
+    output logic signed [31:0] out_y,
+    output logic signed [31:0] out_z,
+    output logic [31:0]        out_color,
+    output logic               out_valid,
+    input  wire                out_ready
 );
 
-    // FSM States
-    typedef enum logic [2:0] {
-        IDLE        = 3'b000,
-        FETCH_ADDR  = 3'b001,
-        FETCH_DATA  = 3'b010,
-        STREAM_OUT  = 3'b011,
-        DONE        = 3'b100
-    } state_t;
+    localparam int CW = $clog2(FIFO_VERTS + 1);   // vertex-count width
+    localparam int PW = $clog2(FIFO_VERTS);       // FIFO pointer width
+    localparam int BW = $clog2(MAX_BURSTS + 1);
+    localparam int LW = $clog2(BURST_VERTS + 1);  // burst length in vertices
 
-    state_t state;
+    assign m_axi_arsize  = 3'd2;   // 4-byte beats
+    assign m_axi_arburst = 2'b01;  // INCR
+    assign m_axi_rready  = 1'b1;   // space is reserved before a burst is issued
 
-    // Internal counters and registers
-    logic [AXI_ADDR_WIDTH-1:0] current_addr;
-    logic [31:0] vertices_remaining;
-    logic [2:0] word_counter; // 0 to 7 (8 words per vertex)
+    // ------------------------------------------------------------ job state
+    logic        active, err;
+    logic [31:0] req_addr;
+    logic [31:0] req_left;         // vertices not yet requested
+    logic [CW-1:0] inflight;       // vertices requested, not yet in the FIFO
+    logic [BW-1:0] bursts_out;     // bursts requested, not yet complete
 
-    // Temporary storage for vertex attributes being assembled
-    logic signed [31:0] v_x, v_y, v_z;
-    logic [31:0] v_color;
+    // ------------------------------------------------------------ vertex FIFO
+    logic [127:0]  fifo_mem [FIFO_VERTS];
+    logic [PW-1:0] wr_ptr, rd_ptr;
+    logic [CW-1:0] fifo_count;
 
-    // Fixed AXI burst parameters
-    assign m_axi_arlen   = 8'd7;   // 8 transfers per burst
-    assign m_axi_arsize  = 3'b010; // 4 bytes (32-bit)
-    assign m_axi_arburst = 2'b01;  // INCR burst
+    // ------------------------------------------------------------ burst length FIFO
+    logic [LW-1:0] len_q [MAX_BURSTS];
+    logic [$clog2(MAX_BURSTS)-1:0] len_wr, len_rd;
 
-    assign busy = (state != IDLE);
+    // ------------------------------------------------------------ issue logic
+    // Vertices left before the next 4 KB boundary (address is 16 B aligned).
+    wire [8:0]  to_4k       = 9'd256 - {1'b0, req_addr[11:4]};
+    wire [31:0] want        = (req_left < 32'(BURST_VERTS)) ? req_left : 32'(BURST_VERTS);
+    wire [LW-1:0] burst_v   = (32'(to_4k) < want) ? LW'(to_4k) : LW'(want);
+    wire [CW:0] committed   = (CW+1)'(fifo_count) + (CW+1)'(inflight);
+    wire        room        = committed + (CW+1)'(burst_v) <= (CW+1)'(FIFO_VERTS);
+    wire        ar_free     = !m_axi_arvalid || m_axi_arready;
+    wire        can_issue   = active && !err && req_left != 0 && room &&
+                              bursts_out < BW'(MAX_BURSTS) && ar_free;
 
-    // Stream output assignments
-    assign stream_vx    = v_x;
-    assign stream_vy    = v_y;
-    assign stream_vz    = v_z;
-    assign stream_color = v_color;
+    // ------------------------------------------------------------ receive logic
+    wire         r_hs      = m_axi_rvalid && m_axi_rready;
+    logic [1:0]  word_idx;             // word within vertex
+    logic [5:0]  beat_idx;             // beat within burst
+    logic [95:0] asm_words;            // x, y, z of the vertex being assembled
+    wire  [5:0]  last_beat = 6'({len_q[len_rd], 2'b00}) - 6'd1;
+    wire         exp_last  = (beat_idx == last_beat);
+    wire         bad_beat  = r_hs && ((m_axi_rresp != 2'b00) || (m_axi_rlast != exp_last));
+    wire         vtx_done  = r_hs && word_idx == 2'd3;
+    wire         push      = vtx_done && !err && !bad_beat;
+    wire         burst_end = r_hs && exp_last;
+
+    // ------------------------------------------------------------ output stage
+    wire pop = (fifo_count != 0) && (!out_valid || out_ready) && !err;
+
+    wire start_job = start && !active;
+
+    // Vertices are 16-byte aligned; the low address bits are ignored.
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire unused_base_lsbs = &{1'b0, base_addr[3:0]};
+    /* verilator lint_on UNUSEDSIGNAL */
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state              <= IDLE;
-            m_axi_arvalid      <= 1'b0;
-            m_axi_araddr       <= '0;
-            m_axi_rready       <= 1'b0;
-            stream_valid       <= 1'b0;
-            done_pulse         <= 1'b0;
-            current_addr       <= '0;
-            vertices_remaining <= '0;
-            word_counter       <= '0;
-            v_x                <= '0;
-            v_y                <= '0;
-            v_z                <= '0;
-            v_color            <= '0;
+            active        <= 1'b0;
+            err           <= 1'b0;
+            error_set     <= 1'b0;
+            req_addr      <= '0;
+            req_left      <= '0;
+            inflight      <= '0;
+            bursts_out    <= '0;
+            m_axi_arvalid <= 1'b0;
+            m_axi_araddr  <= '0;
+            m_axi_arlen   <= '0;
+            wr_ptr        <= '0;
+            rd_ptr        <= '0;
+            fifo_count    <= '0;
+            len_wr        <= '0;
+            len_rd        <= '0;
+            word_idx      <= '0;
+            beat_idx      <= '0;
+            out_valid     <= 1'b0;
         end else begin
-            done_pulse <= 1'b0;
+            error_set <= 1'b0;
 
-            case (state)
-                IDLE: begin
-                    stream_valid <= 1'b0;
-                    m_axi_rready <= 1'b0;
-                    if (start_pulse && vertex_count > 0) begin
-                        current_addr       <= vbuf_base_addr;
-                        vertices_remaining <= vertex_count;
-                        state              <= FETCH_ADDR;
-                    end
+            if (start_job) begin
+                active   <= (vertex_count != 0);
+                err      <= 1'b0;
+                req_addr <= {base_addr[31:4], 4'b0};
+                req_left <= vertex_count;
+                word_idx <= '0;
+                beat_idx <= '0;
+            end
+
+            // --- AR channel
+            if (m_axi_arvalid && m_axi_arready) m_axi_arvalid <= 1'b0;
+            if (can_issue) begin
+                m_axi_arvalid     <= 1'b1;
+                m_axi_araddr      <= req_addr;
+                m_axi_arlen       <= 8'({burst_v, 2'b00}) - 8'd1;
+                len_wr            <= len_wr + 1'b1;
+                req_addr          <= req_addr + 32'({burst_v, 4'b0});
+                req_left          <= req_left - 32'(burst_v);
+            end
+
+            // --- R channel
+            if (r_hs) begin
+                word_idx <= word_idx + 1'b1;
+                if (burst_end) begin
+                    beat_idx <= '0;
+                    len_rd   <= len_rd + 1'b1;
+                end else begin
+                    beat_idx <= beat_idx + 1'b1;
                 end
+            end
+            if (bad_beat && !err) begin
+                err       <= 1'b1;
+                error_set <= 1'b1;
+            end
 
-                // Issue AXI Read Request
-                FETCH_ADDR: begin
-                    m_axi_araddr  <= current_addr;
-                    m_axi_arvalid <= 1'b1;
+            // --- occupancy bookkeeping
+            inflight   <= inflight + (can_issue ? CW'(burst_v) : '0) - (vtx_done ? CW'(1) : '0);
+            bursts_out <= bursts_out + (can_issue ? BW'(1) : '0) - (burst_end ? BW'(1) : '0);
 
-                    if (m_axi_arvalid && m_axi_arready) begin
-                        m_axi_arvalid <= 1'b0;
-                        m_axi_rready  <= 1'b1;
-                        word_counter  <= '0;
-                        state         <= FETCH_DATA;
-                    end
-                end
+            // --- FIFO (flushed on error)
+            if (push) wr_ptr <= wr_ptr + 1'b1;
+            if (pop) rd_ptr <= rd_ptr + 1'b1;
+            if (err) begin
+                rd_ptr     <= wr_ptr;
+                fifo_count <= '0;
+            end else begin
+                fifo_count <= fifo_count + (push ? CW'(1) : '0) - (pop ? CW'(1) : '0);
+            end
 
-                // Receive 8 words over AXI R channel
-                FETCH_DATA: begin
-                    if (m_axi_rvalid && m_axi_rready) begin
-                        case (word_counter)
-                            3'd0: v_x     <= m_axi_rdata;
-                            3'd1: v_y     <= m_axi_rdata;
-                            3'd2: v_z     <= m_axi_rdata;
-                            3'd3: v_color <= m_axi_rdata;
-                            default: ; // Remaining words (e.g. u, v, normals)
-                        endcase
+            // --- output register
+            if (out_valid && out_ready) out_valid <= 1'b0;
+            if (pop) out_valid <= 1'b1;
+            if (err) out_valid <= 1'b0;
 
-                        if (m_axi_rlast || word_counter == 3'd7) begin
-                            m_axi_rready <= 1'b0;
-                            stream_valid <= 1'b1;
-                            state        <= STREAM_OUT;
-                        end else begin
-                            word_counter <= word_counter + 1'b1;
-                        end
-                    end
-                end
-
-                // Handshake stream data to Geometry Engine
-                STREAM_OUT: begin
-                    if (stream_valid && stream_ready) begin
-                        stream_valid       <= 1'b0;
-                        vertices_remaining <= vertices_remaining - 1'b1;
-                        current_addr       <= current_addr + 32; // Advance 32 bytes
-
-                        if (vertices_remaining == 1) begin
-                            done_pulse <= 1'b1;
-                            state      <= IDLE;
-                        end else begin
-                            state      <= FETCH_ADDR;
-                        end
-                    end
-                end
-
-                default: state <= IDLE;
-            endcase
+            // --- job completion: everything requested has arrived and left
+            if (active && !start_job && bursts_out == 0 && !m_axi_arvalid && !can_issue &&
+                (err || (req_left == 0 && fifo_count == 0 && !out_valid)))
+                active <= 1'b0;
         end
     end
 
+    // Storage and data-path registers: no reset (lets the FIFO map to LUTRAM).
+    always_ff @(posedge clk) begin
+        if (can_issue) len_q[len_wr] <= burst_v;
+        if (r_hs) begin
+            case (word_idx)
+                2'd0: asm_words[31:0]  <= m_axi_rdata;
+                2'd1: asm_words[63:32] <= m_axi_rdata;
+                2'd2: asm_words[95:64] <= m_axi_rdata;
+                default: ;
+            endcase
+        end
+        if (push) fifo_mem[wr_ptr] <= {m_axi_rdata, asm_words};
+        if (pop)  {out_color, out_z, out_y, out_x} <= fifo_mem[rd_ptr];
+    end
+
+    assign busy = active;
+
 endmodule
+
+`default_nettype wire

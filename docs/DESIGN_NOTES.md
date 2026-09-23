@@ -79,3 +79,53 @@ an AXI4 read-memory agent with random ARREADY/RVALID, multiple outstanding
 bursts, protocol checks, and error injection. Two harness bugs found along the
 way: Verilator models must be destroyed before their context, and monitors
 must ignore the random pre-reset state that `--x-initial unique` creates.
+
+---
+
+## Phase 3: Vertex fetch
+
+**Decision: shrink the vertex from 32 bytes to 16 (x, y, z, colour).**
+The old format padded each vertex with 4 unused words, and every burst
+fetched them, so half the read bandwidth was wasted. On a 32-bit bus the
+16-byte format caps throughput at exactly 4 cycles per vertex. That number
+sizes the geometry stage in phase 4.
+
+**Decision: multi-vertex bursts, a vertex FIFO, and credit-based prefetch.**
+The old unit issued one burst, waited for all of it, streamed the vertex,
+and only then issued the next request, so memory latency was fully exposed
+on every vertex. Now a burst of up to 4 vertices (16 beats) is issued
+whenever the 16-entry FIFO has room counting data already in flight.
+Reserving space at request time means:
+
+- `RREADY` can be tied high: returning data always has somewhere to go, so
+  the unit never back-pressures the interconnect mid-burst;
+- up to 4 bursts are in flight, which covers roughly 64 cycles of memory
+  latency at full rate.
+
+Measured (unit test, simulation): 256 vertices take 1029 cycles with a
+zero-latency memory (4.02 cycles/vertex against a 4.0 bus limit) and 1060
+cycles with a 32-cycle read latency (4.14 cycles/vertex), with 4 bursts in
+flight at peak.
+
+*Trade-off:* the FIFO is 16 x 128 bits, which is small enough for distributed
+RAM, and its storage sits in a reset-free `always_ff` so it can infer as such.
+A deeper FIFO hides more latency but costs LUTs; 16 already saturates the bus
+at 32 cycles of latency.
+
+**Decision: split bursts at 4 KB boundaries.** AXI forbids a burst from
+crossing a 4 KB boundary. The burst length is `min(4, remaining, vertices
+left before the boundary)`. The memory agent checks every burst, and a
+directed test starts 2 vertices before a boundary (expected bursts: 2, 4, 4, 1).
+
+**Decision: errors are sticky, abandon the draw, and drain the bus.**
+A non-OKAY `RRESP` or an `RLAST` on the wrong beat pulses `error_set` once
+(`STATUS.FETCH_ERR`), stops new requests, discards buffered vertices so no
+partial data reaches the pipeline, and ends the job only when every
+outstanding burst has returned. Ending earlier would let the next job receive
+the tail of the failed job's data. Tests inject both error types and then
+run a clean job.
+
+**Verification:** a scoreboard checks every vertex, in order, across 60 random
+jobs (random length, alignment, AR/R timing, read latency, output
+back-pressure), plus directed boundary, error, and throughput tests.
+It passes on 11 seeds.
