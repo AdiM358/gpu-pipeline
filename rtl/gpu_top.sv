@@ -1,7 +1,7 @@
 `default_nettype none
 
 module gpu_top #(
-    parameter integer AXI_ADDR_WIDTH = 32,
+    parameter integer AXI_ADDR_WIDTH = 32,     // AXI4 master (vertex fetch)
     parameter integer AXI_DATA_WIDTH = 32,
     parameter integer FRAC_BITS      = 16,
     parameter integer SCREEN_W       = 640,
@@ -10,34 +10,25 @@ module gpu_top #(
     input wire clk,
     input wire rst_n,
 
-    // AXI-Lite Slave Interface
-    /* verilator lint_off UNUSEDSIGNAL */
-    input wire [AXI_ADDR_WIDTH-1:0] s_axi_awaddr,
-    /* verilator lint_off UNUSEDSIGNAL */
-    input wire s_axi_awvalid,
-    output logic s_axi_awready,
-
-    input wire [AXI_DATA_WIDTH-1:0] s_axi_wdata,
-    /* verilator lint_off UNUSEDSIGNAL */
-    input wire [3:0] s_axi_wstrb,
-    /* verilator lint_off UNUSEDSIGNAL */
-    input wire s_axi_wvalid,
-    output logic s_axi_wready,
-
-    output logic [1:0] s_axi_bresp,
-    output logic s_axi_bvalid,
-    input wire s_axi_bready,
-
-    /* verilator lint_off UNUSEDSIGNAL */
-    input wire [AXI_ADDR_WIDTH-1:0] s_axi_araddr,
-    /* verilator lint_off UNUSEDSIGNAL */
-    input wire s_axi_arvalid,
-    output logic s_axi_arready,
-
-    output logic [AXI_DATA_WIDTH-1:0] s_axi_rdata,
-    output logic [1:0] s_axi_rresp,
-    output logic s_axi_rvalid,
-    input wire s_axi_rready,
+    // AXI4-Lite slave: register file (docs/REGMAP.md)
+    input  wire  [7:0]  s_axi_awaddr,
+    input  wire         s_axi_awvalid,
+    output logic        s_axi_awready,
+    input  wire  [31:0] s_axi_wdata,
+    input  wire  [3:0]  s_axi_wstrb,
+    input  wire         s_axi_wvalid,
+    output logic        s_axi_wready,
+    output logic [1:0]  s_axi_bresp,
+    output logic        s_axi_bvalid,
+    input  wire         s_axi_bready,
+    input  wire  [7:0]  s_axi_araddr,
+    input  wire         s_axi_arvalid,
+    output logic        s_axi_arready,
+    output logic [31:0] s_axi_rdata,
+    output logic [1:0]  s_axi_rresp,
+    output logic        s_axi_rvalid,
+    input  wire         s_axi_rready,
+    output logic        irq,
 
     // AXI4 Master Interface (VRAM Fetch)
     output logic [AXI_ADDR_WIDTH-1:0] m_axi_araddr,
@@ -69,15 +60,21 @@ module gpu_top #(
     output logic             m_fb_wr_en
 );
 
-    // Control registers from AXI-Lite
-    logic start_pulse;
-    logic [AXI_ADDR_WIDTH-1:0] vbuf_base_addr;
+    // Register file / controller
+    logic        cmd_draw, cmd_clear, cmd_start, done_set;
+    logic        start_pulse;
+    logic        busy;
+    logic [31:0] vbuf_base_addr;
     logic [31:0] vertex_count;
     /* verilator lint_off UNUSEDSIGNAL */
-    logic busy;
-    logic done_pulse;
+    logic        cull_back_en, front_cw;   // consumed once triangle setup exists
+    logic [15:0] clear_color;
+    logic        fetch_done_pulse;
+    logic        start_clear;              // no clear engine in the baseline datapath
     /* verilator lint_on UNUSEDSIGNAL */
-    logic signed [31:0] mvp_matrix [0:3][0:3];
+    logic        fetch_busy;
+    logic signed [31:0] mvp_matrix [4][4];
+    logic [31:0] perf [8];
 
     // Fetch -> Geom interconnect
     logic signed [31:0] fetch_vx, fetch_vy, fetch_vz;
@@ -126,33 +123,92 @@ module gpu_top #(
     logic [31:0]        frag_color;
     logic               frag_valid, frag_ready;
 
-    // Unused AXI-Lite read channels
-    assign s_axi_arready = 1'b0;
-    assign s_axi_rdata   = '0;
-    assign s_axi_rresp   = 2'b00;
-    assign s_axi_rvalid  = 1'b0;
-
-    // Register File
-    axi_lite_s_intf #(
-        .S_AXI_ADDR_WIDTH (7),
-        .S_AXI_DATA_WIDTH (AXI_DATA_WIDTH)
-    ) u_axi_lite_s_intf (
-        .S_AXI_CLK              (clk),
-        .S_AXI_RESETN           (rst_n),
-        .S_AXI_WRITE_ADDR       (s_axi_awaddr[6:0]),
-        .S_AXI_WRITE_ADDR_VALID (s_axi_awvalid),
-        .S_AXI_WRITE_ADDR_READY (s_axi_awready),
-        .S_AXI_WRITE_DATA       (s_axi_wdata),
-        .S_AXI_WRITE_DATA_VALID (s_axi_wvalid),
-        .S_AXI_WRITE_DATA_READY (s_axi_wready),
-        .S_AXI_BRESP            (s_axi_bresp),
-        .S_AXI_BVALID           (s_axi_bvalid),
-        .S_AXI_BREADY           (s_axi_bready),
-        .start_pulse            (start_pulse),
-        .vbuf_base_addr         (vbuf_base_addr),
-        .vertex_count           (vertex_count),
-        .mvp_matrix             (mvp_matrix)
+    axil_regs #(
+        .ADDR_W (8),
+        .FB_W   (SCREEN_W),
+        .FB_H   (SCREEN_H)
+    ) u_regs (
+        .clk           (clk),
+        .rst_n         (rst_n),
+        .s_axi_awaddr  (s_axi_awaddr),
+        .s_axi_awvalid (s_axi_awvalid),
+        .s_axi_awready (s_axi_awready),
+        .s_axi_wdata   (s_axi_wdata),
+        .s_axi_wstrb   (s_axi_wstrb),
+        .s_axi_wvalid  (s_axi_wvalid),
+        .s_axi_wready  (s_axi_wready),
+        .s_axi_bresp   (s_axi_bresp),
+        .s_axi_bvalid  (s_axi_bvalid),
+        .s_axi_bready  (s_axi_bready),
+        .s_axi_araddr  (s_axi_araddr),
+        .s_axi_arvalid (s_axi_arvalid),
+        .s_axi_arready (s_axi_arready),
+        .s_axi_rdata   (s_axi_rdata),
+        .s_axi_rresp   (s_axi_rresp),
+        .s_axi_rvalid  (s_axi_rvalid),
+        .s_axi_rready  (s_axi_rready),
+        .cmd_draw      (cmd_draw),
+        .cmd_clear     (cmd_clear),
+        .vbuf_base     (vbuf_base_addr),
+        .vertex_count  (vertex_count),
+        .cull_back_en  (cull_back_en),
+        .front_cw      (front_cw),
+        .clear_color   (clear_color),
+        .mvp           (mvp_matrix),
+        .irq           (irq),
+        .busy          (busy),
+        .done_set      (done_set),
+        .err_set       (1'b0),
+        .perf          (perf)
     );
+
+    // Interim drain detection for the baseline datapath, which exposes no
+    // idle signals: every inter-stage valid is low and the rasterizer and
+    // pixel map are waiting for input. gpu_ctrl additionally requires this to
+    // hold for several consecutive cycles to cover the stages' internal
+    // pipeline registers.
+    wire pipe_idle = !fetch_valid && !clip_valid && !screen_valid && !tri_valid &&
+                     tri_ready && !frag_valid && frag_ready;
+
+    gpu_ctrl #(
+        .DRAIN_CYCLES (4)
+    ) u_ctrl (
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .cmd_draw    (cmd_draw),
+        .cmd_clear   (cmd_clear),
+        .start_clear (start_clear),
+        .clear_busy  (1'b0),
+        .start_draw  (start_pulse),
+        .fetch_busy  (fetch_busy),
+        .pipe_idle   (pipe_idle),
+        .busy        (busy),
+        .cmd_start   (cmd_start),
+        .done_set    (done_set)
+    );
+
+    // Performance counters (order matches GPU_REG_PERF_* in sw/gpu_regs.h)
+    wire [7:0] perf_inc = {
+        !tri_ready,                  // 7 rasterizer busy cycles
+        m_fb_wr_en,                  // 6 fragments passing depth test
+        frag_valid && frag_ready,    // 5 fragments generated
+        1'b0,                        // 4 triangles clipped
+        1'b0,                        // 3 triangles culled
+        tri_valid && tri_ready,      // 2 triangles assembled
+        fetch_valid && fetch_ready,  // 1 vertices fetched
+        busy                         // 0 command cycles
+    };
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (int i = 0; i < 8; i++) perf[i] <= '0;
+        end else begin
+            for (int i = 0; i < 8; i++) begin
+                if (cmd_start)        perf[i] <= '0;
+                else if (perf_inc[i]) perf[i] <= perf[i] + 1'b1;
+            end
+        end
+    end
 
     // Vertex Fetch Unit
     vertex_fetch #(
@@ -164,8 +220,8 @@ module gpu_top #(
         .start_pulse      (start_pulse),
         .vbuf_base_addr   (vbuf_base_addr),
         .vertex_count     (vertex_count),
-        .busy             (busy),
-        .done_pulse       (done_pulse),
+        .busy             (fetch_busy),
+        .done_pulse       (fetch_done_pulse),
         .m_axi_araddr     (m_axi_araddr),
         .m_axi_arlen      (m_axi_arlen),
         .m_axi_arsize     (m_axi_arsize),
