@@ -1,5 +1,5 @@
 #include <iostream>
-#include <cassert>
+#include "sim.h"
 #include <memory>
 #include <verilated.h>
 #include <verilated_vcd_c.h>
@@ -16,20 +16,26 @@ struct Testbench {
 
     Testbench() {
         top = std::make_unique<Vrasterizer>();
+#if VM_TRACE
         Verilated::traceEverOn(true);
         trace = std::make_unique<VerilatedVcdC>();
         top->trace(trace.get(), 99);
         trace->open("waveform.vcd");
+#endif
     }
 
     ~Testbench() {
-        trace->close();
+#if VM_TRACE
+        if (trace) trace->close();
+#endif
     }
 
     void tick() {
         top->clk = !top->clk;
         top->eval();
-        trace->dump(main_time);
+#if VM_TRACE
+        if (trace) trace->dump(main_time);
+#endif
         main_time++;
     }
 
@@ -80,7 +86,10 @@ int main(int argc, char** argv) {
         tb->clock_cycle();
         if (tb->top->frag_valid) {
             fragment_count++;
-            std::cout << "Fragment generated: (" << tb->top->frag_x << ", " << tb->top->frag_y << ")" << std::endl;
+            const int fx = static_cast<int16_t>(tb->top->frag_x);
+            const int fy = static_cast<int16_t>(tb->top->frag_y);
+            CHECK_MSG(fx >= 10 && fx <= 20 && fy >= 10 && fy <= 20,
+                      "fragment (%d,%d) outside triangle bounding box", fx, fy);
         }
         // Stop if state machine returns to idle after rasterizing
         if (fragment_count > 0 && !tb->top->frag_valid && tb->top->s_tri_ready) {
@@ -89,8 +98,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Total fragments generated for test triangle: " << fragment_count << std::endl;
-    assert(fragment_count > 0 && "Rasterizer failed to generate fragments");
+    CHECK_MSG(fragment_count > 0, "Rasterizer failed to generate fragments");
 
-    std::cout << "Rasterizer unit tests passed." << std::endl;
-    return 0;
+    return tb::summarize("rasterizer", tb->main_time / 2, 1);
 }

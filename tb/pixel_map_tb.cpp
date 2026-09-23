@@ -1,5 +1,5 @@
 #include <iostream>
-#include <cassert>
+#include "sim.h"
 #include <memory>
 #include <vector>
 #include <verilated.h>
@@ -24,23 +24,29 @@ struct Testbench {
 
     Testbench() {
         top = std::make_unique<Vpixel_map>();
+#if VM_TRACE
         Verilated::traceEverOn(true);
         trace = std::make_unique<VerilatedVcdC>();
         top->trace(trace.get(), 99);
         trace->open("waveform.vcd");
+#endif
 
         // Fill Z-buffer with a very high initial depth value
         zbuffer.resize(SCREEN_W * SCREEN_H, 0x7FFFFFFF);
     }
 
     ~Testbench() {
-        trace->close();
+#if VM_TRACE
+        if (trace) trace->close();
+#endif
     }
 
     void tick() {
         top->clk = !top->clk;
         top->eval();
-        trace->dump(main_time);
+#if VM_TRACE
+        if (trace) trace->dump(main_time);
+#endif
         main_time++;
     }
 
@@ -116,25 +122,24 @@ int main(int argc, char** argv) {
 
     std::cout << "Test 1: Initial fragment (Should write)" << std::endl;
     tb->send_fragment(10, 10, 1000, 0xFF0000FF); // Red
-    assert(tb->wrote_fb && "Failed to write initial fragment");
-    assert(tb->last_fb_addr == (10 * 640 + 10) && "Wrong pixel address computed");
-    assert(tb->zbuffer[10 * 640 + 10] == 1000 && "Z-buffer not updated");
+    CHECK_MSG(tb->wrote_fb, "Failed to write initial fragment");
+    CHECK_MSG(tb->last_fb_addr == (10 * 640 + 10), "Wrong pixel address computed");
+    CHECK_MSG(tb->zbuffer[10 * 640 + 10] == 1000, "Z-buffer not updated");
 
     std::cout << "Test 2: Farther fragment to same pixel (Should fail Z-test)" << std::endl;
     tb->send_fragment(10, 10, 2000, 0x00FF00FF); // Green
-    assert(!tb->wrote_fb && "Overwrote pixel with farther depth!");
-    assert(tb->zbuffer[10 * 640 + 10] == 1000 && "Z-buffer improperly updated");
+    CHECK_MSG(!tb->wrote_fb, "Overwrote pixel with farther depth!");
+    CHECK_MSG(tb->zbuffer[10 * 640 + 10] == 1000, "Z-buffer improperly updated");
 
     std::cout << "Test 3: Closer fragment to same pixel (Should pass Z-test)" << std::endl;
     tb->send_fragment(10, 10, 500, 0x0000FFFF); // Blue
-    assert(tb->wrote_fb && "Failed to overwrite with closer depth");
-    assert(tb->last_fb_color == 0x0000FFFF && "Wrong color written");
-    assert(tb->zbuffer[10 * 640 + 10] == 500 && "Z-buffer not updated for closer pixel");
+    CHECK_MSG(tb->wrote_fb, "Failed to overwrite with closer depth");
+    CHECK_MSG(tb->last_fb_color == 0x0000FFFF, "Wrong color written");
+    CHECK_MSG(tb->zbuffer[10 * 640 + 10] == 500, "Z-buffer not updated for closer pixel");
 
     std::cout << "Test 4: Out of bounds fragment (Should be discarded)" << std::endl;
     tb->send_fragment(800, 10, 100, 0xFFFFFFFF); // White (X out of bounds)
-    assert(!tb->wrote_fb && "Wrote out of bounds pixel!");
+    CHECK_MSG(!tb->wrote_fb, "Wrote out of bounds pixel!");
 
-    std::cout << "Pixel map / Z-buffer unit tests passed successfully." << std::endl;
-    return 0;
+    return tb::summarize("pixel_map", tb->main_time / 2, 1);
 }

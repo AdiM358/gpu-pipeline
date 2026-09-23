@@ -20,3 +20,5 @@ build/
 
 # Temporary / Log files
 *.log
+# Generated renders and reports
+out/

@@ -1,5 +1,5 @@
 #include <iostream>
-#include <cassert>
+#include "sim.h"
 #include <memory>
 #include <verilated.h>
 #include <verilated_vcd_c.h>
@@ -22,20 +22,26 @@ struct Testbench {
 
     Testbench() {
         top = std::make_unique<Vpersp_viewport>();
+#if VM_TRACE
         Verilated::traceEverOn(true);
         trace = std::make_unique<VerilatedVcdC>();
         top->trace(trace.get(), 99);
         trace->open("waveform.vcd");
+#endif
     }
 
     ~Testbench() {
-        trace->close();
+#if VM_TRACE
+        if (trace) trace->close();
+#endif
     }
 
     void tick() {
         top->clk = !top->clk;
         top->eval();
-        trace->dump(main_time);
+#if VM_TRACE
+        if (trace) trace->dump(main_time);
+#endif
         main_time++;
     }
 
@@ -88,7 +94,7 @@ int main(int argc, char** argv) {
     while (!tb->top->m_stream_valid) {
         tb->clock_cycle();
         timeout++;
-        assert(timeout < 20 && "Timeout waiting for m_stream_valid");
+        if (!(timeout < 20)) FATAL("Timeout waiting for m_stream_valid");
     }
 
     std::cout << "Viewport output:" << std::endl;
@@ -96,11 +102,10 @@ int main(int argc, char** argv) {
     std::cout << "  Y_screen: " << from_q16(tb->top->m_stream_y_screen) << std::endl;
     std::cout << "  Z_depth:  " << from_q16(tb->top->m_stream_z_depth)  << std::endl;
 
-    assert(tb->top->m_stream_x_screen == to_q16(480.0) && "X screen mismatch");
-    assert(tb->top->m_stream_y_screen == to_q16(120.0) && "Y screen mismatch");
-    assert(tb->top->m_stream_z_depth  == to_q16(0.25)  && "Z depth mismatch");
-    assert(tb->top->m_stream_color    == 0x12345678    && "Color mismatch");
+    CHECK_MSG(tb->top->m_stream_x_screen == to_q16(480.0), "X screen mismatch");
+    CHECK_MSG(tb->top->m_stream_y_screen == to_q16(120.0), "Y screen mismatch");
+    CHECK_MSG(tb->top->m_stream_z_depth  == to_q16(0.25), "Z depth mismatch");
+    CHECK_MSG(tb->top->m_stream_color    == 0x12345678, "Color mismatch");
 
-    std::cout << "Viewport tests passed." << std::endl;
-    return 0;
+    return tb::summarize("persp_viewport", tb->main_time / 2, 1);
 }

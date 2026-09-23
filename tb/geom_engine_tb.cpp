@@ -1,5 +1,5 @@
 #include <iostream>
-#include <cassert>
+#include "sim.h"
 #include <memory>
 #include <vector>
 #include <verilated.h>
@@ -22,20 +22,26 @@ struct Testbench {
 
     Testbench() {
         top = std::make_unique<Vgeom_engine>();
+#if VM_TRACE
         Verilated::traceEverOn(true);
         trace = std::make_unique<VerilatedVcdC>();
         top->trace(trace.get(), 99);
         trace->open("waveform.vcd");
+#endif
     }
 
     ~Testbench() {
-        trace->close();
+#if VM_TRACE
+        if (trace) trace->close();
+#endif
     }
 
     void tick() {
         top->clk = !top->clk;
         top->eval();
-        trace->dump(main_time);
+#if VM_TRACE
+        if (trace) trace->dump(main_time);
+#endif
         main_time++;
     }
 
@@ -104,7 +110,7 @@ int main(int argc, char** argv) {
     while (!tb->top->m_stream_valid) {
         tb->clock_cycle();
         timeout++;
-        assert(timeout < 20 && "Timeout waiting for m_stream_valid");
+        if (!(timeout < 20)) FATAL("Timeout waiting for m_stream_valid");
     }
 
     std::cout << "Identity Matrix Test Output:" << std::endl;
@@ -113,13 +119,12 @@ int main(int argc, char** argv) {
     std::cout << "  Z_clip: " << from_q16(tb->top->m_stream_z_clip) << " (Expected: 3.0)" << std::endl;
     std::cout << "  W_clip: " << from_q16(tb->top->m_stream_w_clip) << " (Expected: 1.0)" << std::endl;
 
-    assert(tb->top->m_stream_x_clip == to_q16(1.0) && "X clip mismatch");
-    assert(tb->top->m_stream_y_clip == to_q16(2.0) && "Y clip mismatch");
-    assert(tb->top->m_stream_z_clip == to_q16(3.0) && "Z clip mismatch");
-    assert(tb->top->m_stream_w_clip == to_q16(1.0) && "W clip mismatch");
-    assert(tb->top->m_stream_color == 0xFF0000FF && "Color mismatch");
+    CHECK_MSG(tb->top->m_stream_x_clip == to_q16(1.0), "X clip mismatch");
+    CHECK_MSG(tb->top->m_stream_y_clip == to_q16(2.0), "Y clip mismatch");
+    CHECK_MSG(tb->top->m_stream_z_clip == to_q16(3.0), "Z clip mismatch");
+    CHECK_MSG(tb->top->m_stream_w_clip == to_q16(1.0), "W clip mismatch");
+    CHECK_MSG(tb->top->m_stream_color == 0xFF0000FF, "Color mismatch");
 
-    std::cout << "Test 1 passed: Identity Matrix Transformation." << std::endl;
 
     tb->clock_cycle();
 
@@ -149,7 +154,7 @@ int main(int argc, char** argv) {
     while (!tb->top->m_stream_valid) {
         tb->clock_cycle();
         timeout++;
-        assert(timeout < 20 && "Timeout waiting for m_stream_valid");
+        if (!(timeout < 20)) FATAL("Timeout waiting for m_stream_valid");
     }
 
     std::cout << "Scale/Translate Matrix Test Output:" << std::endl;
@@ -158,13 +163,11 @@ int main(int argc, char** argv) {
     std::cout << "  Z_clip: " << from_q16(tb->top->m_stream_z_clip) << " (Expected: 0.0)" << std::endl;
     std::cout << "  W_clip: " << from_q16(tb->top->m_stream_w_clip) << " (Expected: 1.0)" << std::endl;
 
-    assert(tb->top->m_stream_x_clip == to_q16(3.0) && "Scale/Trans X mismatch");
-    assert(tb->top->m_stream_y_clip == to_q16(1.0) && "Scale/Trans Y mismatch");
-    assert(tb->top->m_stream_z_clip == to_q16(0.0) && "Scale/Trans Z mismatch");
-    assert(tb->top->m_stream_w_clip == to_q16(1.0) && "Scale/Trans W mismatch");
+    CHECK_MSG(tb->top->m_stream_x_clip == to_q16(3.0), "Scale/Trans X mismatch");
+    CHECK_MSG(tb->top->m_stream_y_clip == to_q16(1.0), "Scale/Trans Y mismatch");
+    CHECK_MSG(tb->top->m_stream_z_clip == to_q16(0.0), "Scale/Trans Z mismatch");
+    CHECK_MSG(tb->top->m_stream_w_clip == to_q16(1.0), "Scale/Trans W mismatch");
 
-    std::cout << "Test 2 passed: Scale and Translate Transformation." << std::endl;
 
-    std::cout << "All geometry engine unit tests passed." << std::endl;
-    return 0;
+    return tb::summarize("geom_engine", tb->main_time / 2, 1);
 }

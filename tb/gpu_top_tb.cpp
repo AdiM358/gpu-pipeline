@@ -1,5 +1,5 @@
 #include <iostream>
-#include <cassert>
+#include "sim.h"
 #include <memory>
 #include <vector>
 #include <verilated.h>
@@ -42,23 +42,29 @@ struct Testbench {
 
     Testbench() {
         top = std::make_unique<Vgpu_top>();
+#if VM_TRACE
         Verilated::traceEverOn(true);
         trace = std::make_unique<VerilatedVcdC>();
         top->trace(trace.get(), 99);
         trace->open("waveform.vcd");
+#endif
 
         vram.resize(1024, 0);
         zbuffer.resize(SCREEN_W * SCREEN_H, 0x7FFFFFFF); // Init to max depth
     }
 
     ~Testbench() {
-        trace->close();
+#if VM_TRACE
+        if (trace) trace->close();
+#endif
     }
 
     void tick() {
         top->clk = !top->clk;
         top->eval();
-        trace->dump(main_time);
+#if VM_TRACE
+        if (trace) trace->dump(main_time);
+#endif
         main_time++;
     }
 
@@ -123,7 +129,7 @@ struct Testbench {
         while (!aw_done || !w_done) {
             clock_cycle();
             timeout++;
-            assert(timeout < 100 && "Timeout waiting for AXI-Lite AWREADY/WREADY");
+            if (timeout >= 100) FATAL("Timeout waiting for AXI-Lite AWREADY/WREADY");
 
             if (top->s_axi_awready && top->s_axi_awvalid) {
                 top->s_axi_awvalid = 0;
@@ -139,7 +145,7 @@ struct Testbench {
         while (!top->s_axi_bvalid) {
             clock_cycle();
             timeout++;
-            assert(timeout < 100 && "Timeout waiting for AXI-Lite BVALID");
+            if (timeout >= 100) FATAL("Timeout waiting for AXI-Lite BVALID");
         }
 
         clock_cycle();
@@ -292,15 +298,24 @@ int main(int argc, char** argv) {
     std::cout << "Rendering 3D Cube (12 Triangles)..." << std::endl;
     int fragment_count = 0;
     int cycles = 0;
+    int last_write = 0;
 
-    // Run until pipeline finishes rendering (increased timeout for larger object)
+    // Run until the pipeline has been quiet for a long time (the baseline
+    // design has no end-of-frame signal).
     while (cycles < 250000) {
         tb->clock_cycle();
         cycles++;
-        if (tb->top->m_fb_wr_en) fragment_count++;
+        if (tb->top->m_fb_wr_en) {
+            fragment_count++;
+            last_write = cycles;
+            CHECK_MSG(tb->top->m_fb_wr_addr < Testbench::SCREEN_W * Testbench::SCREEN_H,
+                      "framebuffer write address %u out of range", tb->top->m_fb_wr_addr);
+        }
     }
+    std::cout << "Framebuffer writes: " << fragment_count << ", last at cycle " << last_write << std::endl;
+    CHECK_MSG(fragment_count > 1000, "cube produced only %d framebuffer writes", fragment_count);
+    CHECK_MSG(last_write < 200000, "pipeline still writing near the end of the run");
 
-    std::cout << "Top-level end-to-end integration tests passed successfully" << std::endl;
     tb->save_framebuffer_to_ppm("render_output.ppm");
-    return 0;
+    return tb::summarize("gpu_top", cycles, 1);
 }
