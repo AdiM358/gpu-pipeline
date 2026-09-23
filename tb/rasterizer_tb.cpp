@@ -160,6 +160,54 @@ int main(int argc, char** argv) {
     h.ready_pct = 50;
     run();
 
+    // ---- precision stress: slivers (tiny area, huge gradients) with extreme
+    //      attribute values and vertices on pixel centres. Rounding can land
+    //      just outside the vertex range here, which is what the clamp is for.
+    h.to_send.clear();
+    h.sent = 0;
+    uint64_t clamp_cases = 0;
+    for (int i = 0; i < 3000; ++i) {
+        auto ext = [&]() {
+            const uint16_t z = sim.chance(50) ? 0 : 0xFFFF;
+            const uint32_t c = sim.chance(50) ? 0 : 0xFFFFFF;
+            return std::pair<uint16_t, uint32_t>(sim.chance(30) ? static_cast<uint16_t>(sim.rand_u32()) : z,
+                                                 sim.chance(30) ? (sim.rand_u32() & 0xFFFFFF) : c);
+        };
+        const int x0 = 16 * sim.rand_range(10, 300) + 8, y0 = 16 * sim.rand_range(10, 220) + 8;
+        const int dx = sim.rand_range(-400, 400), dy = sim.rand_range(-400, 400);
+        auto [za, ca] = ext();
+        auto [zb, cb] = ext();
+        auto [zc, cc] = ext();
+        const ScreenVtx a{static_cast<int16_t>(x0), static_cast<int16_t>(y0), za, ca, 0};
+        const ScreenVtx b{static_cast<int16_t>(x0 + dx), static_cast<int16_t>(y0 + dy), zb, cb, 0};
+        // Third vertex within a sub-pixel or two of the line a-b.
+        const ScreenVtx c{static_cast<int16_t>(x0 + dx / 2 + sim.rand_range(-2, 2)),
+                          static_cast<int16_t>(y0 + dy / 2 + sim.rand_range(-2, 2)), zc, cc, 0};
+        const size_t before_n = h.to_send.size();
+        add(a, b, c);
+        if (h.to_send.size() > before_n) {
+            // Count fragments where the unclamped value falls outside the range.
+            std::vector<model::Fragment> f;
+            const model::TriSetup& t = h.to_send.back();
+            for (int py = t.py0; py <= t.py1; ++py)
+                for (int px = t.px0; px <= t.px1; ++px) {
+                    const int64_t ddx = px - t.px0, ddy = py - t.py0;
+                    bool in = true;
+                    for (int e = 0; e < 3; ++e) in &= t.e0[e] + ddx * t.ex[e] + ddy * t.ey[e] >= 0;
+                    if (!in) continue;
+                    for (int k = 0; k < 4; ++k) {
+                        const int64_t acc = model::wrap(t.a0[k] + ddx * t.ax[k] + ddy * t.ay[k], 38);
+                        const int64_t v = model::wrap(acc + (1 << 19), 38) >> 20;
+                        clamp_cases += (v < t.amin[k] || v > t.amax[k]);
+                    }
+                }
+        }
+    }
+    h.valid_pct = h.ready_pct = 100;
+    run();
+    std::printf("  sliver stress: %zu triangles, %llu attribute values clamped\n", h.to_send.size(),
+                (unsigned long long)clamp_cases);
+
     // ---- fill rule: jittered mesh, vertices often exactly on pixel centres;
     //      every covered pixel must be written exactly once, no interior holes.
     h.to_send.clear();
