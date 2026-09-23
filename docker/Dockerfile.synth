@@ -1,0 +1,9 @@
+# Open-source synthesis cross-check: sv2v (SystemVerilog -> Verilog) + Yosys.
+# This is NOT a substitute for Vivado; see fpga/README.md.
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        yosys make python3 curl unzip ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -sSL -o /tmp/sv2v.zip https://github.com/zachjs/sv2v/releases/download/v0.0.12/sv2v-Linux.zip \
+    && unzip -q /tmp/sv2v.zip -d /tmp && install /tmp/sv2v-Linux/sv2v /usr/local/bin/sv2v && rm -rf /tmp/sv2v*
+WORKDIR /work
