@@ -28,6 +28,7 @@ public:
     size_t max_outstanding = 8;
     uint32_t err_lo = 0, err_hi = 0;
     int bad_rlast_burst = -1;
+    uint32_t latency = 0;  // cycles from AR handshake to the first R beat
 
     // Statistics
     uint64_t bursts = 0, beats = 0;
@@ -45,6 +46,11 @@ public:
     }
 
     void observe() override {
+        if (!d_.rst_n) {  // DUT outputs are random until reset is applied
+            ar_wait_ = false;
+            r_hs_ = false;
+            return;
+        }
         // Master must hold ARVALID and ARADDR until the handshake.
         if (ar_wait_) {
             CHECK_MSG(d_.m_axi_arvalid, "ARVALID dropped before ARREADY");
@@ -54,7 +60,8 @@ public:
         ar_wait_addr_ = d_.m_axi_araddr;
 
         if (d_.m_axi_arvalid && d_.m_axi_arready) {
-            Burst b{d_.m_axi_araddr, static_cast<uint32_t>(d_.m_axi_arlen) + 1, 0, bursts};
+            Burst b{d_.m_axi_araddr, static_cast<uint32_t>(d_.m_axi_arlen) + 1, 0, bursts,
+                    sim_.cycle + latency};
             CHECK_EQ(d_.m_axi_arsize, 2u);   // 4-byte beats
             CHECK_EQ(d_.m_axi_arburst, 1u);  // INCR
             CHECK_MSG((b.addr & 3) == 0, "unaligned ARADDR 0x%08x", b.addr);
@@ -76,7 +83,7 @@ public:
         d_.m_axi_arready = queue_.size() < max_outstanding && sim_.chance(ar_ready_pct);
 
         if (d_.m_axi_rvalid && !r_hs_) return;  // hold the presented beat
-        if (queue_.empty() || !sim_.chance(r_valid_pct)) {
+        if (queue_.empty() || sim_.cycle < queue_.front().ready_at || !sim_.chance(r_valid_pct)) {
             d_.m_axi_rvalid = 0;
             d_.m_axi_rlast = 0;
             return;
@@ -98,6 +105,7 @@ private:
     struct Burst {
         uint32_t addr, len, beat;
         uint64_t id;
+        uint64_t ready_at;
     };
     size_t index(uint32_t addr) const { return (addr - base_) / 4; }
 
