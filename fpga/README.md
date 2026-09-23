@@ -42,11 +42,15 @@ vectorless power into `fpga/reports/<run>/`. `fpga/summarize.py` writes
 ## Yosys cross-check (runs without Vivado)
 
 `fpga/yosys_report.py` converts the RTL with sv2v and maps it with Yosys
-`synth_xilinx -family xc7`. It gives cell counts and a structural logic-depth
-proxy (`ltp`, the longest combinational path in mapped cells), **not timing**.
-It is here to show that the design synthesises, that the buffers infer block
-RAM and the multipliers infer DSPs, and how logic depth changed against the
-baseline. Results: `fpga/reports/yosys_summary.md`.
+`synth_xilinx -family xc7`. It gives cell counts only: **no timing and no
+logic depth**. It is here to show that the design synthesises, that the
+buffers infer block RAM and the multipliers infer DSPs, and how resource use
+changed against the baseline. Results: `fpga/reports/yosys_summary.md`.
+
+(Yosys' `ltp -noff` was tried as a logic-depth proxy and dropped: after
+`synth_xilinx` it does not stop at mapped flip-flops, so a 50-stage register
+pipeline reports a path length of 153. Logic levels come from Vivado's
+`report_design_analysis` instead.)
 
 ```sh
 docker build -t gpu-synth -f docker/Dockerfile.synth docker
