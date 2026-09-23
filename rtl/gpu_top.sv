@@ -1,14 +1,14 @@
 `default_nettype none
 
+// GPU top level (interim: new front end and rasterizer, baseline pixel_map
+// and external Z-buffer until the ROP lands).
 module gpu_top #(
-    parameter integer AXI_ADDR_WIDTH = 32,     // AXI4 master (vertex fetch)
-    parameter integer AXI_DATA_WIDTH = 32,
-    parameter integer FRAC_BITS      = 16,
-    parameter integer SCREEN_W       = 640,
-    parameter integer SCREEN_H       = 480
+    parameter int SCREEN_W  = 640,
+    parameter int SCREEN_H  = 480,
+    parameter int RAST_SPAN = 4
 )(
-    input wire clk,
-    input wire rst_n,
+    input  wire         clk,
+    input  wire         rst_n,
 
     // AXI4-Lite slave: register file (docs/REGMAP.md)
     input  wire  [7:0]  s_axi_awaddr,
@@ -30,180 +30,183 @@ module gpu_top #(
     input  wire         s_axi_rready,
     output logic        irq,
 
-    // AXI4 Master Interface (VRAM Fetch)
-    output logic [AXI_ADDR_WIDTH-1:0] m_axi_araddr,
-    output logic [7:0] m_axi_arlen,
-    output logic [2:0] m_axi_arsize,
-    output logic [1:0] m_axi_arburst,
-    output logic m_axi_arvalid,
-    input wire m_axi_arready,
+    // AXI4 read master: vertex buffer
+    output logic [31:0] m_axi_araddr,
+    output logic [7:0]  m_axi_arlen,
+    output logic [2:0]  m_axi_arsize,
+    output logic [1:0]  m_axi_arburst,
+    output logic        m_axi_arvalid,
+    input  wire         m_axi_arready,
+    input  wire  [31:0] m_axi_rdata,
+    input  wire  [1:0]  m_axi_rresp,
+    input  wire         m_axi_rlast,
+    input  wire         m_axi_rvalid,
+    output logic        m_axi_rready,
 
-    input wire [AXI_DATA_WIDTH-1:0] m_axi_rdata,
-    input wire [1:0] m_axi_rresp,
-    input wire m_axi_rlast,
-    input wire m_axi_rvalid,
-    output logic m_axi_rready,
-
-    // Memory Interface: Z-Buffer (Read)
-    output logic [31:0]      m_zbuf_rd_addr,
-    output logic             m_zbuf_rd_en,
-    input wire [31:0]        s_zbuf_rd_data,
-
-    // Memory Interface: Z-Buffer (Write)
-    output logic [31:0]      m_zbuf_wr_addr,
+    // Baseline external Z-buffer and framebuffer write ports
+    output logic [31:0]        m_zbuf_rd_addr,
+    output logic               m_zbuf_rd_en,
+    input  wire  [31:0]        s_zbuf_rd_data,
+    output logic [31:0]        m_zbuf_wr_addr,
     output logic signed [31:0] m_zbuf_wr_data,
-    output logic             m_zbuf_wr_en,
-
-    // Memory Interface: Framebuffer (Write)
-    output logic [31:0]      m_fb_wr_addr,
-    output logic [31:0]      m_fb_wr_data,
-    output logic             m_fb_wr_en
+    output logic               m_zbuf_wr_en,
+    output logic [31:0]        m_fb_wr_addr,
+    output logic [31:0]        m_fb_wr_data,
+    output logic               m_fb_wr_en
 );
 
-    // Register file / controller
-    logic        cmd_draw, cmd_clear, cmd_start, done_set;
-    logic        start_pulse;
-    logic        busy;
-    logic [31:0] vbuf_base_addr;
-    logic [31:0] vertex_count;
+    // ================================================================ control
+    logic        cmd_draw, cmd_clear, cmd_start, done_set, busy;
+    logic        start_draw;
     /* verilator lint_off UNUSEDSIGNAL */
-    logic        cull_back_en, front_cw;   // consumed once triangle setup exists
-    logic [15:0] clear_color;
-    logic        start_clear;              // no clear engine in the baseline datapath
+    logic        start_clear;    // drives the clear engine (ROP, next phase)
     /* verilator lint_on UNUSEDSIGNAL */
-    logic        fetch_busy, fetch_err;
-    logic signed [31:0] mvp_matrix [4][4];
+    logic [31:0] vbuf_base, vertex_count;
+    logic        cull_back, front_cw;
+    /* verilator lint_off UNUSEDSIGNAL */
+    logic [15:0] clear_color;    // used by the clear engine (ROP, next phase)
+    /* verilator lint_on UNUSEDSIGNAL */
+    logic signed [31:0] mvp [4][4];
     logic [31:0] perf [8];
+    logic        fetch_busy, fetch_err;
+    logic        pipe_idle;
 
-    // Fetch -> Geom interconnect
-    logic signed [31:0] fetch_vx, fetch_vy, fetch_vz;
-    logic [23:0] fetch_color;
-    logic fetch_valid, fetch_ready;
-
-    // Geom -> Persp interconnect
-    /* verilator lint_off UNUSEDSIGNAL */
-    logic signed [31:0] clip_x /* verilator public */;
-    logic signed [31:0] clip_y /* verilator public */;
-    logic signed [31:0] clip_z /* verilator public */;
-    logic signed [31:0] clip_w /* verilator public */;
-
-    logic [23:0]        clip_color /* verilator public */;
-    logic               clip_valid /* verilator public */;
-    logic               clip_ready /* verilator public */;
-    /* verilator lint_on UNUSEDSIGNAL */
-
-
-    logic geom_idle, persp_idle;
-    logic signed [15:0] scr_sx, scr_sy;
-    logic [15:0] scr_z;
-    logic [23:0] scr_color;
-    /* verilator lint_off UNUSEDSIGNAL */
-    logic [7:0]  scr_flags;   // consumed by triangle setup (next phase)
-    /* verilator lint_on UNUSEDSIGNAL */
-
-    // Persp -> Prim Assembly interconnect
-    logic signed [31:0] screen_x, screen_y, screen_z;
-    logic [31:0] screen_color;
-    logic screen_valid, screen_ready;
-
-    // Prim Assembly -> Rasterizer interconnect
-    logic signed [31:0] tri_v0_x /* verilator public */;
-    logic signed [31:0] tri_v0_y /* verilator public */;
-    logic signed [31:0] tri_v0_z /* verilator public */;
-    
-    logic signed [31:0] tri_v1_x /* verilator public */;
-    logic signed [31:0] tri_v1_y /* verilator public */;
-    logic signed [31:0] tri_v1_z /* verilator public */;
-    
-    logic signed [31:0] tri_v2_x /* verilator public */;
-    logic signed [31:0] tri_v2_y /* verilator public */;
-    logic signed [31:0] tri_v2_z /* verilator public */;
-    
-    logic [31:0]        tri_color /* verilator public */;
-    
-    logic               tri_valid /* verilator public */;
-    logic               tri_ready /* verilator public */;
-
-    // Rasterizer -> Pixel Map interconnect
-    logic signed [15:0] frag_x, frag_y;
-    logic signed [31:0] frag_z;
-    logic [31:0]        frag_color;
-    logic               frag_valid, frag_ready;
-
-    axil_regs #(
-        .ADDR_W (8),
-        .FB_W   (SCREEN_W),
-        .FB_H   (SCREEN_H)
-    ) u_regs (
-        .clk           (clk),
-        .rst_n         (rst_n),
-        .s_axi_awaddr  (s_axi_awaddr),
-        .s_axi_awvalid (s_axi_awvalid),
-        .s_axi_awready (s_axi_awready),
-        .s_axi_wdata   (s_axi_wdata),
-        .s_axi_wstrb   (s_axi_wstrb),
-        .s_axi_wvalid  (s_axi_wvalid),
-        .s_axi_wready  (s_axi_wready),
-        .s_axi_bresp   (s_axi_bresp),
-        .s_axi_bvalid  (s_axi_bvalid),
-        .s_axi_bready  (s_axi_bready),
-        .s_axi_araddr  (s_axi_araddr),
-        .s_axi_arvalid (s_axi_arvalid),
-        .s_axi_arready (s_axi_arready),
-        .s_axi_rdata   (s_axi_rdata),
-        .s_axi_rresp   (s_axi_rresp),
-        .s_axi_rvalid  (s_axi_rvalid),
-        .s_axi_rready  (s_axi_rready),
-        .cmd_draw      (cmd_draw),
-        .cmd_clear     (cmd_clear),
-        .vbuf_base     (vbuf_base_addr),
-        .vertex_count  (vertex_count),
-        .cull_back_en  (cull_back_en),
-        .front_cw      (front_cw),
-        .clear_color   (clear_color),
-        .mvp           (mvp_matrix),
-        .irq           (irq),
-        .busy          (busy),
-        .done_set      (done_set),
-        .err_set       (fetch_err),
-        .perf          (perf)
+    axil_regs #(.ADDR_W(8), .FB_W(SCREEN_W), .FB_H(SCREEN_H)) u_regs (
+        .clk, .rst_n,
+        .s_axi_awaddr, .s_axi_awvalid, .s_axi_awready,
+        .s_axi_wdata, .s_axi_wstrb, .s_axi_wvalid, .s_axi_wready,
+        .s_axi_bresp, .s_axi_bvalid, .s_axi_bready,
+        .s_axi_araddr, .s_axi_arvalid, .s_axi_arready,
+        .s_axi_rdata, .s_axi_rresp, .s_axi_rvalid, .s_axi_rready,
+        .cmd_draw, .cmd_clear,
+        .vbuf_base, .vertex_count, .cull_back_en(cull_back), .front_cw,
+        .clear_color, .mvp, .irq,
+        .busy, .done_set, .err_set(fetch_err), .perf
     );
 
-    // Interim drain detection for the baseline datapath, which exposes no
-    // idle signals: every inter-stage valid is low and the rasterizer and
-    // pixel map are waiting for input. gpu_ctrl additionally requires this to
-    // hold for several consecutive cycles to cover the stages' internal
-    // pipeline registers.
-    wire pipe_idle = geom_idle && persp_idle && !tri_valid &&
-                     tri_ready && !frag_valid && frag_ready;
-
-    gpu_ctrl #(
-        .DRAIN_CYCLES (4)
-    ) u_ctrl (
-        .clk         (clk),
-        .rst_n       (rst_n),
-        .cmd_draw    (cmd_draw),
-        .cmd_clear   (cmd_clear),
-        .start_clear (start_clear),
-        .clear_busy  (1'b0),
-        .start_draw  (start_pulse),
-        .fetch_busy  (fetch_busy),
-        .pipe_idle   (pipe_idle),
-        .busy        (busy),
-        .cmd_start   (cmd_start),
-        .done_set    (done_set)
+    gpu_ctrl #(.DRAIN_CYCLES(4)) u_ctrl (
+        .clk, .rst_n,
+        .cmd_draw, .cmd_clear,
+        .start_clear, .clear_busy(1'b0),
+        .start_draw, .fetch_busy, .pipe_idle,
+        .busy, .cmd_start, .done_set
     );
+
+    // ================================================================ geometry
+    logic signed [31:0] f_x, f_y, f_z;
+    logic [23:0]        f_color;
+    logic               f_valid, f_ready;
+
+    vertex_fetch u_fetch (
+        .clk, .rst_n,
+        .start(start_draw), .base_addr(vbuf_base), .vertex_count,
+        .busy(fetch_busy), .error_set(fetch_err),
+        .m_axi_araddr, .m_axi_arlen, .m_axi_arsize, .m_axi_arburst,
+        .m_axi_arvalid, .m_axi_arready,
+        .m_axi_rdata, .m_axi_rresp, .m_axi_rlast, .m_axi_rvalid, .m_axi_rready,
+        .out_x(f_x), .out_y(f_y), .out_z(f_z), .out_color(f_color),
+        .out_valid(f_valid), .out_ready(f_ready)
+    );
+
+    logic signed [31:0] c_x, c_y, c_z, c_w;
+    logic [23:0]        c_color;
+    logic               c_valid, c_ready, geom_idle;
+
+    geom_engine u_geom (
+        .clk, .rst_n, .mvp,
+        .in_x(f_x), .in_y(f_y), .in_z(f_z), .in_color(f_color),
+        .in_valid(f_valid), .in_ready(f_ready),
+        .out_x(c_x), .out_y(c_y), .out_z(c_z), .out_w(c_w), .out_color(c_color),
+        .out_valid(c_valid), .out_ready(c_ready), .idle(geom_idle)
+    );
+
+    logic signed [15:0] s_sx, s_sy;
+    logic [15:0]        s_z;
+    logic [23:0]        s_color;
+    logic [7:0]         s_flags;
+    logic               s_valid, s_ready, persp_idle;
+
+    persp_viewport #(.SCREEN_W(SCREEN_W), .SCREEN_H(SCREEN_H)) u_persp (
+        .clk, .rst_n,
+        .in_x(c_x), .in_y(c_y), .in_z(c_z), .in_w(c_w), .in_color(c_color),
+        .in_valid(c_valid), .in_ready(c_ready),
+        .out_sx(s_sx), .out_sy(s_sy), .out_z(s_z), .out_color(s_color), .out_flags(s_flags),
+        .out_valid(s_valid), .out_ready(s_ready), .idle(persp_idle)
+    );
+
+    logic signed [15:0] t_sx [3], t_sy [3];
+    logic [15:0]        t_z [3];
+    logic [23:0]        t_color [3];
+    logic [7:0]         t_flags [3];
+    logic               t_valid, t_ready, prim_idle;
+
+    prim_assembly u_prim (
+        .clk, .rst_n, .flush(start_draw),
+        .in_sx(s_sx), .in_sy(s_sy), .in_z(s_z), .in_color(s_color), .in_flags(s_flags),
+        .in_valid(s_valid), .in_ready(s_ready),
+        .out_sx(t_sx), .out_sy(t_sy), .out_z(t_z), .out_color(t_color), .out_flags(t_flags),
+        .out_valid(t_valid), .out_ready(t_ready), .idle(prim_idle)
+    );
+
+    // ================================================================ raster
+    logic [9:0]         r_px0, r_px1, r_py0, r_py1;
+    logic signed [33:0] r_e0 [3];
+    logic signed [20:0] r_ex [3], r_ey [3];
+    logic signed [37:0] r_a0 [4], r_ax [4], r_ay [4];
+    logic [15:0]        r_amin [4], r_amax [4];
+    logic               r_valid, r_ready, setup_idle, tri_culled, tri_clipped;
+
+    tri_setup #(.SCREEN_W(SCREEN_W), .SCREEN_H(SCREEN_H)) u_setup (
+        .clk, .rst_n, .cull_back, .front_cw,
+        .in_sx(t_sx), .in_sy(t_sy), .in_z(t_z), .in_color(t_color), .in_flags(t_flags),
+        .in_valid(t_valid), .in_ready(t_ready),
+        .out_px0(r_px0), .out_px1(r_px1), .out_py0(r_py0), .out_py1(r_py1),
+        .out_e0(r_e0), .out_ex(r_ex), .out_ey(r_ey),
+        .out_a0(r_a0), .out_ax(r_ax), .out_ay(r_ay), .out_amin(r_amin), .out_amax(r_amax),
+        .out_valid(r_valid), .out_ready(r_ready),
+        .culled(tri_culled), .clipped(tri_clipped), .idle(setup_idle)
+    );
+
+    logic [9:0]  fr_x, fr_y;
+    logic [15:0] fr_z;
+    logic [7:0]  fr_r, fr_g, fr_b;
+    logic        fr_valid, fr_ready, rast_busy, rast_idle;
+
+    rasterizer #(.SPAN(RAST_SPAN)) u_rast (
+        .clk, .rst_n,
+        .in_px0(r_px0), .in_px1(r_px1), .in_py0(r_py0), .in_py1(r_py1),
+        .in_e0(r_e0), .in_ex(r_ex), .in_ey(r_ey),
+        .in_a0(r_a0), .in_ax(r_ax), .in_ay(r_ay), .in_amin(r_amin), .in_amax(r_amax),
+        .in_valid(r_valid), .in_ready(r_ready),
+        .frag_x(fr_x), .frag_y(fr_y), .frag_z(fr_z), .frag_r(fr_r), .frag_g(fr_g), .frag_b(fr_b),
+        .frag_valid(fr_valid), .frag_ready(fr_ready),
+        .busy(rast_busy), .idle(rast_idle)
+    );
+
+    // ================================================================ back end (baseline)
+    pixel_map #(.SCREEN_W(SCREEN_W), .SCREEN_H(SCREEN_H)) u_pixel_map (
+        .clk, .rst_n,
+        .s_frag_x({6'd0, fr_x}), .s_frag_y({6'd0, fr_y}), .s_frag_z({16'd0, fr_z}),
+        .s_frag_color({8'd0, fr_r, fr_g, fr_b}),
+        .s_frag_valid(fr_valid), .s_frag_ready(fr_ready),
+        .m_zbuf_rd_addr, .m_zbuf_rd_en, .s_zbuf_rd_data,
+        .m_zbuf_wr_addr, .m_zbuf_wr_data, .m_zbuf_wr_en,
+        .m_fb_wr_addr, .m_fb_wr_data, .m_fb_wr_en
+    );
+
+    // ================================================================ status
+    assign pipe_idle = geom_idle && persp_idle && prim_idle && setup_idle && rast_idle && fr_ready;
 
     // Performance counters (order matches GPU_REG_PERF_* in sw/gpu_regs.h)
     wire [7:0] perf_inc = {
-        !tri_ready,                  // 7 rasterizer busy cycles
-        m_fb_wr_en,                  // 6 fragments passing depth test
-        frag_valid && frag_ready,    // 5 fragments generated
-        1'b0,                        // 4 triangles clipped
-        1'b0,                        // 3 triangles culled
-        tri_valid && tri_ready,      // 2 triangles assembled
-        fetch_valid && fetch_ready,  // 1 vertices fetched
-        busy                         // 0 command cycles
+        rast_busy,               // 7 rasterizer busy cycles
+        m_fb_wr_en,              // 6 fragments passing the depth test
+        fr_valid && fr_ready,    // 5 fragments generated
+        tri_clipped,             // 4 triangles rejected
+        tri_culled,              // 3 triangles culled
+        t_valid && t_ready,      // 2 triangles assembled
+        f_valid && f_ready,      // 1 vertices fetched
+        busy                     // 0 command cycles
     };
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -217,177 +220,13 @@ module gpu_top #(
         end
     end
 
-    // Vertex Fetch Unit
-    vertex_fetch u_vertex_fetch (
-        .clk              (clk),
-        .rst_n            (rst_n),
-        .start            (start_pulse),
-        .base_addr        (vbuf_base_addr),
-        .vertex_count     (vertex_count),
-        .busy             (fetch_busy),
-        .error_set        (fetch_err),
-        .m_axi_araddr     (m_axi_araddr),
-        .m_axi_arlen      (m_axi_arlen),
-        .m_axi_arsize     (m_axi_arsize),
-        .m_axi_arburst    (m_axi_arburst),
-        .m_axi_arvalid    (m_axi_arvalid),
-        .m_axi_arready    (m_axi_arready),
-        .m_axi_rdata      (m_axi_rdata),
-        .m_axi_rresp      (m_axi_rresp),
-        .m_axi_rlast      (m_axi_rlast),
-        .m_axi_rvalid     (m_axi_rvalid),
-        .m_axi_rready     (m_axi_rready),
-        .out_x            (fetch_vx),
-        .out_y            (fetch_vy),
-        .out_z            (fetch_vz),
-        .out_color        (fetch_color),
-        .out_valid        (fetch_valid),
-        .out_ready        (fetch_ready)
-    );
-
-    // Geometry Engine
-    geom_engine u_geom_engine (
-        .clk        (clk),
-        .rst_n      (rst_n),
-        .mvp        (mvp_matrix),
-        .in_x       (fetch_vx),
-        .in_y       (fetch_vy),
-        .in_z       (fetch_vz),
-        .in_color   (fetch_color),
-        .in_valid   (fetch_valid),
-        .in_ready   (fetch_ready),
-        .out_x      (clip_x),
-        .out_y      (clip_y),
-        .out_z      (clip_z),
-        .out_w      (clip_w),
-        .out_color  (clip_color),
-        .out_valid  (clip_valid),
-        .out_ready  (clip_ready),
-        .idle       (geom_idle)
-    );
-
-    // Perspective Divide & Viewport Scaling
-    persp_viewport #(
-        .SCREEN_W   (SCREEN_W),
-        .SCREEN_H   (SCREEN_H)
-    ) u_persp_viewport (
-        .clk        (clk),
-        .rst_n      (rst_n),
-        .in_x       (clip_x),
-        .in_y       (clip_y),
-        .in_z       (clip_z),
-        .in_w       (clip_w),
-        .in_color   (clip_color),
-        .in_valid   (clip_valid),
-        .in_ready   (clip_ready),
-        .out_sx     (scr_sx),
-        .out_sy     (scr_sy),
-        .out_z      (scr_z),
-        .out_color  (scr_color),
-        .out_flags  (scr_flags),
-        .out_valid  (screen_valid),
-        .out_ready  (screen_ready),
-        .idle       (persp_idle)
-    );
-
-    // Interim shim: the baseline assembly/rasterizer still take Q16.16.
-    assign screen_x     = {{4{scr_sx[15]}}, scr_sx, 12'b0};
-    assign screen_y     = {{4{scr_sy[15]}}, scr_sy, 12'b0};
-    assign screen_z     = {16'b0, scr_z};
-    assign screen_color = {8'b0, scr_color};
-
-    // Primitive Assembly
-    prim_assembly #(
-        .DATA_WIDTH (AXI_DATA_WIDTH)
-    ) u_prim_assembly (
-        .clk         (clk),
-        .rst_n       (rst_n),
-        .s_v_x       (screen_x),
-        .s_v_y       (screen_y),
-        .s_v_z       (screen_z),
-        .s_v_color   (screen_color),
-        .s_v_valid   (screen_valid),
-        .s_v_ready   (screen_ready),
-        .m_v0_x      (tri_v0_x),
-        .m_v0_y      (tri_v0_y),
-        .m_v0_z      (tri_v0_z),
-        .m_v1_x      (tri_v1_x),
-        .m_v1_y      (tri_v1_y),
-        .m_v1_z      (tri_v1_z),
-        .m_v2_x      (tri_v2_x),
-        .m_v2_y      (tri_v2_y),
-        .m_v2_z      (tri_v2_z),
-        .m_color     (tri_color),
-        .m_tri_valid (tri_valid),
-        .m_tri_ready (tri_ready)
-    );
-
-    // Incremental Pineda Rasterizer
-    rasterizer #(
-        .DATA_WIDTH (AXI_DATA_WIDTH),
-        .FRAC_BITS  (FRAC_BITS),
-        .SCREEN_W   (SCREEN_W),
-        .SCREEN_H   (SCREEN_H)
-    ) u_rasterizer (
-        .clk         (clk),
-        .rst_n       (rst_n),
-        .s_v0_x      (tri_v0_x),
-        .s_v0_y      (tri_v0_y),
-        .s_v0_z      (tri_v0_z),
-        .s_v1_x      (tri_v1_x),
-        .s_v1_y      (tri_v1_y),
-        .s_v1_z      (tri_v1_z),
-        .s_v2_x      (tri_v2_x),
-        .s_v2_y      (tri_v2_y),
-        .s_v2_z      (tri_v2_z),
-        .s_color     (tri_color),
-        .s_tri_valid (tri_valid),
-        .s_tri_ready (tri_ready),
-        .frag_x      (frag_x),
-        .frag_y      (frag_y),
-        .frag_z      (frag_z),
-        .frag_color  (frag_color),
-        .frag_valid  (frag_valid),
-        .frag_ready  (frag_ready)
-    );
-
-    // Pixel Map (Z-Buffer Depth Test & Memory Address Gen)
-    pixel_map #(
-        .SCREEN_W (SCREEN_W),
-        .SCREEN_H (SCREEN_H)
-    ) u_pixel_map (
-        .clk            (clk),
-        .rst_n          (rst_n),
-        .s_frag_x       (frag_x),
-        .s_frag_y       (frag_y),
-        .s_frag_z       (frag_z),
-        .s_frag_color   (frag_color),
-        .s_frag_valid   (frag_valid),
-        .s_frag_ready   (frag_ready),
-        .m_zbuf_rd_addr (m_zbuf_rd_addr),
-        .m_zbuf_rd_en   (m_zbuf_rd_en),
-        .s_zbuf_rd_data (s_zbuf_rd_data),
-        .m_zbuf_wr_addr (m_zbuf_wr_addr),
-        .m_zbuf_wr_data (m_zbuf_wr_data),
-        .m_zbuf_wr_en   (m_zbuf_wr_en),
-        .m_fb_wr_addr   (m_fb_wr_addr),
-        .m_fb_wr_data   (m_fb_wr_data),
-        .m_fb_wr_en     (m_fb_wr_en)
-    );
-
-    // Dual-Port BRAM Framebuffer
-    framebuffer #(
-        .SCREEN_W (SCREEN_W),
-        .SCREEN_H (SCREEN_H),
-        .DATA_WIDTH (32)
-    ) u_framebuffer (
-        .clk       (clk),
-        .s_wr_addr (m_fb_wr_addr),
-        .s_wr_data (m_fb_wr_data),
-        .s_wr_en   (m_fb_wr_en),
-        .s_rd_addr (32'b0), // Unused until VGA controller is added
+    // The baseline framebuffer stays for one more phase (read port unused).
+    framebuffer #(.SCREEN_W(SCREEN_W), .SCREEN_H(SCREEN_H), .DATA_WIDTH(32)) u_framebuffer (
+        .clk,
+        .s_wr_addr(m_fb_wr_addr), .s_wr_data(m_fb_wr_data), .s_wr_en(m_fb_wr_en),
+        .s_rd_addr(32'b0),
         /* verilator lint_off PINCONNECTEMPTY */
-        .m_rd_data () // Not connected until VGA controller is added
+        .m_rd_data()
         /* verilator lint_on PINCONNECTEMPTY */
     );
 

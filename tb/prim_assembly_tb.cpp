@@ -1,109 +1,112 @@
-#include <iostream>
-#include "sim.h"
-#include <memory>
-#include <verilated.h>
-#include <verilated_vcd_c.h>
+// prim_assembly: random vertex streams grouped into triangles in order under
+// random handshakes; back-to-back throughput; flush drops a partial triangle.
+#include <deque>
+
 #include "Vprim_assembly.h"
+#include "gpu_model.h"
+#include "sim.h"
 
-struct Testbench {
-    std::unique_ptr<Vprim_assembly> top;
-    std::unique_ptr<VerilatedVcdC> trace;
-    uint64_t main_time = 0;
+using Dut = Vprim_assembly;
+using model::ScreenVtx;
 
-    Testbench() {
-        top = std::make_unique<Vprim_assembly>();
-#if VM_TRACE
-        Verilated::traceEverOn(true);
-        trace = std::make_unique<VerilatedVcdC>();
-        top->trace(trace.get(), 99);
-        trace->open("waveform.vcd");
-#endif
-    }
+namespace {
 
-    ~Testbench() {
-#if VM_TRACE
-        if (trace) trace->close();
-#endif
-    }
+struct Harness : tb::Agent {
+    tb::Sim<Dut>& sim;
+    Dut& d;
+    std::vector<ScreenVtx> to_send;
+    std::deque<ScreenVtx> expected;  // vertices of complete triangles, in order
+    size_t sent = 0;
+    uint64_t tris = 0;
+    int valid_pct = 100, ready_pct = 100;
+    bool last_hs = false;
+    explicit Harness(tb::Sim<Dut>& s) : sim(s), d(*s.dut) {}
 
-    void tick() {
-        top->clk = !top->clk;
-        top->eval();
-#if VM_TRACE
-        if (trace) trace->dump(main_time);
-#endif
-        main_time++;
-    }
-
-    void clock_cycle() {
-        top->clk = 0;
-        tick();
-        top->clk = 1;
-        tick();
-    }
-
-    void reset() {
-        top->rst_n = 0;
-        top->s_v_x = 0;
-        top->s_v_y = 0;
-        top->s_v_z = 0;
-        top->s_v_color = 0;
-        top->s_v_valid = 0;
-        top->m_tri_ready = 1;
-
-        for (int i = 0; i < 5; i++) {
-            clock_cycle();
+    void observe() override {
+        last_hs = d.in_valid && d.in_ready;
+        if (!d.rst_n) return;
+        if (last_hs) ++sent;
+        if (d.out_valid && d.out_ready) {
+            for (int k = 0; k < 3; ++k) {
+                if (expected.empty()) FATAL("unexpected triangle");
+                const ScreenVtx got{static_cast<int16_t>(d.out_sx[k]), static_cast<int16_t>(d.out_sy[k]),
+                                    d.out_z[k], d.out_color[k], d.out_flags[k]};
+                CHECK_MSG(got == expected.front(), "triangle %llu vertex %d mismatch", (unsigned long long)tris, k);
+                expected.pop_front();
+            }
+            ++tris;
         }
-        top->rst_n = 1;
-        clock_cycle();
-        std::cout << "Reset complete." << std::endl;
     }
-
-    void send_vertex(int32_t x, int32_t y, int32_t z, uint32_t color) {
-        top->s_v_x = x;
-        top->s_v_y = y;
-        top->s_v_z = z;
-        top->s_v_color = color;
-        top->s_v_valid = 1;
-
-        clock_cycle();
-
-        while (!top->s_v_ready) {
-            clock_cycle();
+    void drive() override {
+        if (!(d.in_valid && !last_hs)) {
+            d.in_valid = sent < to_send.size() && sim.chance(valid_pct);
+            if (sent < to_send.size()) {
+                const ScreenVtx& v = to_send[sent];
+                d.in_sx = static_cast<uint16_t>(v.sx);
+                d.in_sy = static_cast<uint16_t>(v.sy);
+                d.in_z = v.z;
+                d.in_color = v.color;
+                d.in_flags = v.flags;
+            }
         }
-
-        top->s_v_valid = 0;
+        d.out_ready = sim.chance(ready_pct);
     }
 };
 
+}  // namespace
+
 int main(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
-    auto tb = std::make_unique<Testbench>();
+    tb::Sim<Dut> sim(argc, argv, "prim_assembly");
+    Dut& d = *sim.dut;
+    Harness h(sim);
+    sim.add_agent(&h);
+    d.in_valid = 0;
+    d.out_ready = 1;
+    d.flush = 0;
+    sim.reset();
 
-    tb->reset();
+    auto rnd = [&]() {
+        return ScreenVtx{static_cast<int16_t>(sim.rand_u32()), static_cast<int16_t>(sim.rand_u32()),
+                         static_cast<uint16_t>(sim.rand_u32()), sim.rand_u32() & 0xFFFFFF,
+                         static_cast<uint8_t>(sim.rand_u32())};
+    };
+    // Queue n vertices; the complete triangles among them become expectations.
+    auto queue = [&](size_t n) {
+        const size_t base = h.to_send.size();
+        for (size_t i = 0; i < n; ++i) h.to_send.push_back(rnd());
+        for (size_t i = 0; i + 3 <= n; i += 3)
+            for (int k = 0; k < 3; ++k) h.expected.push_back(h.to_send[base + i + k]);
+    };
+    auto drain = [&]() {
+        const uint64_t t0 = sim.cycle;
+        while (h.sent < h.to_send.size() || !d.idle) {
+            sim.tick();
+            if (sim.cycle - t0 > 100000) FATAL("stalled");
+        }
+        return sim.cycle - t0;
+    };
+    auto flush = [&]() {
+        d.flush = 1;
+        sim.tick();
+        d.flush = 0;
+    };
 
-    // Send 3 vertices to form 1 triangle
-    tb->send_vertex(10, 20, 30, 0xFF0000FF); // V0
-    tb->send_vertex(40, 50, 60, 0xFF0000FF); // V1
-    tb->send_vertex(70, 80, 90, 0xFF0000FF); // V2
+    // Back-to-back: 3 cycles per triangle, no bubbles.
+    queue(300);
+    const uint64_t t = drain();
+    CHECK_EQ(h.tris, 100u);
+    CHECK_MSG(t <= 300 + 3, "assembly inserted bubbles (%llu cycles for 300 vertices)", (unsigned long long)t);
 
-    // Verify triangle valid and vertex data
-    int timeout = 0;
-    while (!tb->top->m_tri_valid) {
-        tb->clock_cycle();
-        timeout++;
-        if (!(timeout < 20)) FATAL("Timeout waiting for m_tri_valid");
+    // Random handshakes, and draws whose length is not a multiple of 3: the
+    // leftover vertices must be discarded by the flush at the next draw.
+    for (int draw = 0; draw < 50; ++draw) {
+        h.valid_pct = sim.rand_range(20, 100);
+        h.ready_pct = sim.rand_range(20, 100);
+        queue(sim.rand_range(0, 40));
+        drain();
+        CHECK(h.expected.empty());
+        flush();
     }
-
-    std::cout << "Primitive Assembly Output:" << std::endl;
-    std::cout << "  V0: (" << tb->top->m_v0_x << ", " << tb->top->m_v0_y << ", " << tb->top->m_v0_z << ")" << std::endl;
-    std::cout << "  V1: (" << tb->top->m_v1_x << ", " << tb->top->m_v1_y << ", " << tb->top->m_v1_z << ")" << std::endl;
-    std::cout << "  V2: (" << tb->top->m_v2_x << ", " << tb->top->m_v2_y << ", " << tb->top->m_v2_z << ")" << std::endl;
-
-    CHECK_MSG(tb->top->m_v0_x == 10 && tb->top->m_v0_y == 20 && tb->top->m_v0_z == 30, "V0 mismatch");
-    CHECK_MSG(tb->top->m_v1_x == 40 && tb->top->m_v1_y == 50 && tb->top->m_v1_z == 60, "V1 mismatch");
-    CHECK_MSG(tb->top->m_v2_x == 70 && tb->top->m_v2_y == 80 && tb->top->m_v2_z == 90, "V2 mismatch");
-    CHECK_MSG(tb->top->m_color == 0xFF0000FF, "Color mismatch");
-
-    return tb::summarize("prim_assembly", tb->main_time / 2, 1);
+    CHECK_EQ(d.idle, 1);
+    return sim.finish();
 }

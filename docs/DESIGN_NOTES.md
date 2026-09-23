@@ -199,3 +199,99 @@ least once.
 **Testbench gotcha:** Verilator does not mask input ports narrower than the C
 type. A random 32-bit colour driven into a 24-bit port kept its top byte all
 the way to the output. Testbenches now mask inputs to port width.
+
+---
+
+## Phase 5: Triangle setup and rasterizer
+
+**Bug fixed: flat depth (B1), off-by-one fragment coordinates (B2), dropped
+last pixel (B3), double-drawn edges (B4), flat colour, no culling (B5).**
+The rasterizer was rewritten. The system test now compares full frames
+against the golden model, pixel for pixel, on 8 scenes (see phase 6 for the
+final list).
+
+**Decision: triangle setup is its own unit, separate from traversal.**
+Everything that happens once per triangle lives in `tri_setup`: reject,
+cull, area, edge equations, gradients. The rasterizer's inner loop is only
+additions. Setup takes 57 cycles per rasterized triangle (measured) and
+far fewer for culled or rejected ones. It overlaps with rasterization of the
+previous triangle, because its result waits in an output register while the
+next triangle is set up.
+
+**Decision: one shared multiplier and an iterative reciprocal in setup.**
+Setup runs 38 multiplies per triangle through a single 38x26 pipelined
+multiplier, and 1/area comes from a 25-iteration restoring divider. This is
+the opposite choice from the perspective stage (phase 4), for the same
+reason: rate. Setup runs once per triangle and hides behind rasterization,
+which takes hundreds of cycles for any triangle that matters, so spending
+more hardware to make it faster buys nothing. The divider runs in parallel
+with the 22 multiplies that don't need 1/area.
+
+*Normalised reciprocal:* 1/area needs to be accurate for triangles from
+1/256 px^2 up to about 2^31 sub-pixel^2 in area. Normalising, `R =
+floor(2^55 / (A << clz(A)))`, gives a 24-bit mantissa for every size, and the
+gradient shift `35 - clz(A)` restores the exponent.
+
+**Decision: incremental Z and Gouraud colour, all stepped the same way.**
+Each attribute (z, r, g, b) is a plane `a(x,y) = a0 + ax*dx + ay*dy`. Setup
+computes `a0` at the first pixel and the per-pixel steps. The rasterizer only
+adds, the same as for edge functions. Screen-space linear depth is exact for
+z/w, which is affine in screen space. For colour it is the standard Gouraud
+approximation (not perspective-correct; see Limitations).
+
+*Why 38-bit accumulators can wrap harmlessly:* the rasterizer steps across
+the whole bounding box, including uncovered pixels, where extrapolated
+values can be huge. The accumulators are modular (mod 2^38), and every
+covered pixel's true value fits in 38 bits, so the value is exact at every
+pixel that is actually drawn, whatever happened in between. The model uses
+explicit `wrap(…, 38)` to match, and a final clamp to the vertex min/max
+absorbs sub-LSB rounding at edges.
+
+**Decision: top-left fill rule.** Setup normalises every triangle to positive
+winding (swapping v1/v2), so "inside" is always "all three edge functions
+>= 0". Edges that are not top or left get a bias of -1, so a pixel exactly
+on a shared edge belongs to exactly one triangle. Test: a jittered 10x10
+mesh (200 triangles) with half its vertices exactly on pixel centres must
+cover all 14,400 pixels with 0 double writes and 0 holes. It passes at every
+SPAN value.
+
+**Decision: span traversal (`RAST_SPAN` pixels tested per cycle).**
+The ROP takes one fragment per cycle, so emitting more is pointless. The
+waste in a bounding-box rasterizer is the cycles spent on *empty* pixels,
+which is about half the box for a typical triangle. Stage T tests SPAN pixel
+centres per cycle (SPAN copies of the edge adders) and skips an empty span
+in one cycle. Stage S emits covered pixels one per cycle. T keeps skipping
+empty spans while S is still emitting.
+
+Measured (unit test, fixed 200-triangle workload, 30,645 fragments, no
+back-pressure):
+
+| SPAN | cycles | fragments/cycle |
+|---:|---:|---:|
+| 1 (plain bounding-box walk) | 118,403 | 0.259 |
+| 4 (default) | 46,999 | 0.652 |
+| 8 | 35,469 | 0.864 |
+
+*Cost:* SPAN x 3 edge adders and comparators, plus SPAN-entry step tables for
+four 38-bit attributes. SPAN=4 is the default as the knee of the curve; the
+Vivado sweep in phase 9 prices each point.
+
+*Constraint found by writing the code:* a new triangle may load only after
+stage S has drained, because S reads the per-triangle step tables. Double
+buffering the tables would remove this bubble (up to SPAN cycles per
+triangle) at the cost of another table set.
+
+**Decision: empty bounding boxes count as "clipped".** A triangle can survive
+frustum reject and still cover no pixel centre, either because it is tiny or
+because it only touches the guard band. Setup drops it and counts it with the
+rejected triangles, which keeps `tri_in = culled + clipped + rasterized`.
+
+**Decision: cull configuration is latched with each triangle.** Found by the
+unit test, which changes `RASTER_CFG` between triangles. Reading the live
+register three cycles after acceptance would apply the wrong mode to a
+triangle in flight.
+
+**Testbench lesson: outcomes are not in program order.** While a rasterizable
+triangle waits in setup's output register, the next triangle can already be
+culled. The scoreboard matches "output" to the oldest unresolved triangle
+and cull/clip pulses to the oldest one not parked in the output register.
