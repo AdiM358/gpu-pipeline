@@ -458,3 +458,31 @@ through the driver, is compared with the golden model (all pixels match),
 and is read back through the hardware port to `out/demo/*.ppm`.
 `scripts/make_gif.py` converts the frames into `docs/img/demo.gif` without
 touching pixel values (2x nearest-neighbour upscale, GIF palette).
+
+---
+
+## Phase 9: FPGA flow (no board, no Vivado)
+
+**Vivado was not installed on the build machine.** `fpga/build.tcl`
+(out-of-context synth, opt, place, phys_opt, route, then reports) and
+`fpga/sweep.sh` (clock-period sweep, RAST_SPAN sweep, baseline-vs-new modules)
+are written but **have not been run**. Fmax, Vivado utilization, timing and
+power are therefore blank in METRICS.md. The commands are in `fpga/README.md`.
+`fpga/summarize.py` was tested against a hand-written report in Vivado's format
+(then discarded) and prints "no runs found" when there are none.
+
+**Open-source cross-check that did run.** sv2v 0.0.12 + Yosys 0.33
+(`docker/Dockerfile.synth`):
+
+    sv2v --top=gpu_top rtl/*.sv > gpu_top.v
+    yosys -p "read_verilog gpu_top.v; synth_xilinx -family xc7 -top gpu_top -flatten; stat"
+
+Result for the default configuration (RAST_SPAN=4): **76 RAMB36E1**, which
+matches the 2 x 38 capacity calculation; **48 DSP48E1**; 10,957 LUT (LUT1–LUT6,
+excluding memory LUTs); 8,870 flip-flops; 33 RAM32M (the vertex FIFO, in
+LUTRAM as intended); 299 SRL16E/SRLC32E (the divider payload shift register);
+1,169 CARRY4. This shows the RTL synthesises and infers block RAM, DSPs, LUTRAM
+and SRLs where the design intends. It is not timing and not Vivado's
+mapping. `fpga/yosys_report.py` extends it to every RAST_SPAN and to
+baseline-vs-new modules with a logic-depth proxy; that full matrix had not
+finished when this was written.
