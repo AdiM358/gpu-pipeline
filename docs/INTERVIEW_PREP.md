@@ -208,8 +208,8 @@ Tell each one as **problem → options → decision → evidence**.
   is strong evidence**, because I didn't just translate the RTL into C++.
 - Unit tests compare each stage bit-exactly under random inputs and random
   back-pressure. The system test compares every pixel, every depth value and
-  every counter on 16 renders, plus 48 demo frames.
-- Coverage is 98.9% (349/353). I can explain each of the 4 misses: two are
+  every counter on 17 system-test frames, plus 48 demo frames.
+- Coverage is 98.9% (356/360). I can explain each of the 4 misses: two are
   unreachable FSM default branches, and two are a clamp that is unreachable
   in practice. A search of 97.8 million sliver-triangle fragments found a
   worst overshoot of 0.0049 LSB, about 100 times below where the clamp
@@ -269,7 +269,7 @@ multiple clock domains (there is only one clock).
 
 | Claim | Number | Source |
 |---|---|---|
-| Timing closure | WNS −2.291 ns → +0.253 ns at 10 ns (100 MHz) | Vivado 2026.1 post-route, `fpga/reports/*_viewport_split_10ns/` |
+| Timing closure / Fmax | WNS −2.291 ns → +0.253 ns at 10 ns; **Fmax 100 MHz** (9.5, 9, 8 ns fail) | Vivado 2026.1 post-route, `fpga/reports/*_viewport_split_10ns/` |
 | Utilization at 100 MHz | 9,590 LUT (18.0%), 9,317 FF (8.8%), 98 BRAM tiles (70.0%), 36 DSP (16.4%) | Vivado post-route `util.rpt` |
 | Power | 0.377 W | Vivado *vectorless estimate*, not measured |
 | Vertex fetch | 11.00 → 4.02 cycles/vertex; 42.00 → 4.14 with 32-cycle latency | simulation, `make baseline-bench` vs `test-vertex_fetch` |
@@ -278,11 +278,11 @@ multiple clock domains (there is only one clock).
 | System draw speed-up, SPAN 1 → 4 | 1.71x (demo cube), 2.10x (dense scene) | simulation, `make perf` |
 | Setup latency | 57 cycles | simulation, `test-tri_setup` |
 | Clear | 76,801 cycles | simulation, `test-gpu_top` |
-| Demo frame | mean 100,663 cycles/frame (clear + 2 cubes), 48 frames | simulation, `make demo` |
-| Frame rate projection | ~993 frames/s at 100 MHz (100 MHz ÷ 100,663 cycles) | **projection**: simulated cycles ÷ a clock that met timing |
+| Demo frame | mean 100,665 cycles/frame (clear + 2 cubes), 48 frames | simulation, `make demo` |
+| Frame rate projection | ~993 frames/s at 100 MHz (100 MHz ÷ 100,665 cycles) | **projection**: simulated cycles ÷ a clock that met timing |
 | Resource reduction | `persp_viewport` 40,296 → 3,393 LUT; `geom_engine` 48 → 12 DSP | Yosys cross-check (not Vivado) |
-| Coverage | 98.9% line (349/353 points) | `make coverage` |
-| Correctness | every pixel and counter matches the model on 16 renders + 48 demo frames | simulation |
+| Coverage | 98.9% line (356/360 points) | `make coverage` |
+| Correctness | every pixel and counter matches the model on 17 system-test frames + 48 demo frames | simulation |
 
 How to phrase the frame rate: *"About a thousand frames per second for the
 demo scene, projected from simulated cycle counts at 100 MHz. Most of that

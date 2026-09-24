@@ -178,10 +178,10 @@ flowchart LR
   4 KB burst splits, bus errors, near/guard-band boundaries, degenerate and
   sliver triangles, the fill-rule mesh, and depth hazards at every
   forwarding distance.
-- **System test:** 16 renders compared pixel-for-pixel and counter-for-counter
+- **System test:** 17 frames compared pixel-for-pixel (and counter-for-counter)
   with the model, including random memory latency, a command written while
   busy, the IRQ pin, bus-error recovery, and a partial triangle.
-- **Coverage:** 98.9% line coverage (349/353 points). The 4 misses are two
+- **Coverage:** 98.9% line coverage (356/360 points). The 4 misses are two
   unreachable FSM defaults and an attribute clamp that a 97.8-million-fragment
   search showed is never triggered.
 - **CI:** the same Verilator version as local runs; lint, coverage regression,
