@@ -553,3 +553,29 @@ it. That is future work; the design fits as is.
 Windows Vivado install, and `python3` is the Microsoft Store placeholder.
 `fpga/sweep.ps1` calls Git Bash explicitly, and `sweep.sh` picks the first
 Python that actually runs.
+
+**Clock sweep (`fpga/sweep.sh period 10 9.5 9 8`, results in
+`fpga/reports/summary.md`):**
+
+| Period | WNS | Met |
+|---:|---:|:-:|
+| 10.0 ns | +0.253 ns | yes |
+| 9.5 ns | -0.951 ns | no |
+| 9.0 ns | -0.863 ns | no |
+| 8.0 ns | -2.213 ns | no |
+
+**Fmax = 100 MHz**, the fastest swept period with WNS >= 0. The 10 ns run
+reproduced the earlier result exactly (+0.253 ns): the flow is deterministic.
+9.5 ns failing by more than 9 ns shows that place-and-route results near the
+limit are not monotonic in the clock period.
+
+What limits a faster clock differs by run. At 9.5 ns it is the V1 depth
+arithmetic (`pz2 -> depth_v1`, two carry chains: `+2^20` then `x65535`). At
+9 ns it is `vertex_fetch`: `req_left` and `req_addr` depend on the burst
+length, which is a three-way minimum (4, vertices remaining, vertices to the
+4 KB boundary) followed by a subtract in the same cycle. The next steps,
+neither done yet:
+
+1. Fold `+2^20` into the M2 register (`(p + 2^44) >>> 24 == (p >>> 24) + 2^20`,
+   exact), leaving one carry chain in V1.
+2. Register the burst length in vertex fetch one cycle ahead of issue.

@@ -1,0 +1,29 @@
+Copyright 1986-2022 Xilinx, Inc. All Rights Reserved. Copyright 2022-2026 Advanced Micro Devices, Inc. All Rights Reserved.
+---------------------------------------------------------------------------------------------------------------------------------------------
+| Tool Version : Vivado v.2026.1 (win64) Build 6511674 Tue Jun 16 11:02:23 MDT 2026
+| Date         : Thu Sep 24 13:52:34 2026
+| Host         : AdiLap running 64-bit major release  (build 9200)
+| Command      : report_design_analysis -logic_level_distribution -file fpga/reports/period_9ns/logic_levels.rpt
+| Design       : gpu_top
+| Device       : xc7z020
+| Design State : Routed
+---------------------------------------------------------------------------------------------------------------------------------------------
+
+Report Design Analysis
+
+Table of Contents
+-----------------
+1. Logic Level Distribution
+
+1. Logic Level Distribution
+---------------------------
+
++-----------------+-------------+---+----+----+---+----+-----+-----+----+---+----+----+----+----+----+----+----+----+----+----+----+
+| End Point Clock | Requirement | 0 |  1 |  2 | 3 |  5 |  6  |  7  |  8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 |
++-----------------+-------------+---+----+----+---+----+-----+-----+----+---+----+----+----+----+----+----+----+----+----+----+----+
+| clk             | 9.000ns     | 6 | 94 | 18 | 1 | 29 | 113 | 418 | 40 | 7 | 56 | 38 | 75 | 37 | 23 |  8 |  8 |  8 |  8 |  8 |  5 |
++-----------------+-------------+---+----+----+---+----+-----+-----+----+---+----+----+----+----+----+----+----+----+----+----+----+
+* Columns represent the logic levels per end point clock
+** Distribution is for top worst 1000 paths
+
+
