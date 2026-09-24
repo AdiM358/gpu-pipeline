@@ -7,7 +7,10 @@
 //   D  recip = floor(2^44 / w)     32-stage pipelined divider, 1/cycle
 //   M1 n = clip * recip            3 multiplies instead of 3 divides
 //   M2 product register
-//   V  NDC (Q.20) -> Q11.4 screen coordinates, guard-band flag, 16-bit depth
+//   V1 NDC (Q.20) -> screen coordinate and depth arithmetic (registered)
+//   V2 guard-band compare, depth clamp, output register
+//      (V was one stage; Vivado timed it at 22 logic levels / -2.29 ns slack
+//       at 10 ns, so the wide arithmetic and the compares were split)
 //
 // Screen: sx = 8W*(1 + x/w), sy = 8H*(1 - y/w) in 1/16 px (y points down);
 // depth = clamp((z/w + 1) * 65535/2, 0, 65535).
@@ -36,7 +39,6 @@ module persp_viewport #(
     localparam logic signed [31:0] W_NEAR = 32'sh0000_1000;  // 1/16
     localparam logic signed [63:0] HW = 64'(8 * SCREEN_W);     // half width, 1/16 px
     localparam logic signed [63:0] HH = 64'(8 * SCREEN_H);
-    localparam logic signed [63:0] GUARD = 64'sd16384;
 
     wire en = !out_valid || out_ready;
     assign in_ready = en;
@@ -118,36 +120,59 @@ module persp_viewport #(
         end
     end
 
-    // ---------------------------------------------------------------- V
+    // ---------------------------------------------------------------- V1
     wire signed [39:0] nx = 40'(px2 >>> 24);   // Q.20 NDC
     wire signed [39:0] ny = 40'(py2 >>> 24);
     wire signed [39:0] nz = 40'(pz2 >>> 24);
 
+    // |sx|,|sy| < 2^31 and |depth| < 2^34 for any 40-bit NDC, so 48 bits
+    // hold these exactly.
+    /* verilator lint_off UNUSEDSIGNAL */
     wire signed [63:0] sx_full = (64'(nx) * HW + (HW <<< 20)) >>> 20;
     wire signed [63:0] sy_full = ((HH <<< 20) - 64'(ny) * HH) >>> 20;
-    wire               gb = sx_full < -GUARD || sx_full >= GUARD ||
-                            sy_full < -GUARD || sy_full >= GUARD;
-
     wire signed [63:0] depth_full = ((64'(nz) + 64'sd1048576) * 64'sd65535) >>> 21;
-    wire [15:0] depth = depth_full < 0 ? 16'd0 :
-                        depth_full > 64'sd65535 ? 16'hFFFF : depth_full[15:0];
+    /* verilator lint_on UNUSEDSIGNAL */
+
+    logic               vld_v1;
+    logic signed [47:0] sx_v1, sy_v1, depth_v1;
+    logic [30:0]        v1_meta;
 
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)  out_valid <= 1'b0;
-        else if (en) out_valid <= vld_m2;
+        if (!rst_n)  vld_v1 <= 1'b0;
+        else if (en) vld_v1 <= vld_m2;
     end
     always_ff @(posedge clk) begin
         if (en) begin
-            out_sx    <= sx_full[15:0];
-            out_sy    <= sy_full[15:0];
+            sx_v1    <= sx_full[47:0];
+            sy_v1    <= sy_full[47:0];
+            depth_v1 <= depth_full[47:0];
+            v1_meta  <= m2_meta;
+        end
+    end
+
+    // ---------------------------------------------------------------- V2
+    localparam logic signed [47:0] GUARD48 = 48'sd16384;
+    wire gb = sx_v1 < -GUARD48 || sx_v1 >= GUARD48 ||
+              sy_v1 < -GUARD48 || sy_v1 >= GUARD48;
+    wire [15:0] depth = depth_v1 < 0 ? 16'd0 :
+                        depth_v1 > 48'sd65535 ? 16'hFFFF : depth_v1[15:0];
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)  out_valid <= 1'b0;
+        else if (en) out_valid <= vld_v1;
+    end
+    always_ff @(posedge clk) begin
+        if (en) begin
+            out_sx    <= sx_v1[15:0];
+            out_sy    <= sy_v1[15:0];
             out_z     <= depth;
-            out_color <= m2_meta[23:0];
-            out_flags <= {gb, m2_meta[30], m2_meta[29:24]};
+            out_color <= v1_meta[23:0];
+            out_flags <= {gb, v1_meta[30], v1_meta[29:24]};
         end
     end
 
     // Idle: every accepted vertex has been delivered. A counter is simpler
-    // than OR-ing the valid bits of all 36 stages. Max occupancy is 36 < 128.
+    // than OR-ing the valid bits of all 37 stages. Max occupancy is 37 < 128.
     logic [6:0] in_flight;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) in_flight <= '0;

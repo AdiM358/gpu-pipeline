@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Vivado batch sweeps for the XC7Z020. Run from the repository root with
-# Vivado (2020.1 or newer) on PATH:
+# Vivado (2020.1 or newer) on PATH. On Windows use Git Bash, or the
+# PowerShell wrapper fpga/sweep.ps1 (plain `bash` in PowerShell is WSL's):
 #
 #   fpga/sweep.sh period   [periods...]   # default design, clock-period sweep
 #   fpga/sweep.sh span     [period]       # RAST_SPAN 1/2/4/8 at one period
@@ -14,6 +15,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPORTS=fpga/reports
 mkdir -p "$REPORTS"
+
+# On Windows, "python3" is often the Microsoft Store placeholder; use the
+# first interpreter that actually runs.
+PY=""
+for p in python3 python; do
+    if "$p" -c "import sys" >/dev/null 2>&1; then PY=$p; break; fi
+done
+[ -n "$PY" ] || { echo "no working python found"; exit 1; }
+command -v vivado >/dev/null || { echo "vivado is not on PATH"; exit 1; }
 
 vivado_run() {  # period span out_dir [top] [rtl_dir]
     local out=$3
@@ -54,4 +64,4 @@ case "${1:-all}" in
     all)      sweep_period; sweep_span; baseline_modules ;;
     *) echo "usage: $0 {period|span|baseline|all} [args]"; exit 1 ;;
 esac
-python3 fpga/summarize.py "$REPORTS" | tee "$REPORTS/summary.md"
+"$PY" fpga/summarize.py "$REPORTS" | tee "$REPORTS/summary.md"
