@@ -510,3 +510,46 @@ Yosys' `ltp -noff` as a logic-depth proxy. The full-design numbers
 50-stage register pipeline (length 153 after `synth_xilinx`, 5 after generic
 `synth`) showed that `ltp` walks through mapped Xilinx flip-flops. The column
 was removed and not reported. Logic depth comes only from Vivado.
+
+---
+
+## Phase 9b: First Vivado results and a timing fix
+
+Vivado 2026.1 (ML Standard) became available, so the flow in `fpga/` ran for
+real. Command: `vivado -mode batch -source fpga/build.tcl -tclargs 10.0 4 <dir>`
+(out-of-context, xc7z020clg400-1, post-route).
+
+**The first implementation failed timing at 100 MHz.** WNS was -2.291 ns at a
+10 ns period, with 72 failing endpoints. All of the 20 worst paths ran from
+`persp_viewport`'s product register to its depth output: 22 logic levels (15
+CARRY4). The viewport stage did the NDC shift, the depth scale
+`(z/w + 1) * 65535`, a 64-bit shift, and the clamp and guard-band compares in
+a single cycle. Two long carry chains were in series with the comparators.
+
+**Fix: split that stage in two.** V1 registers the screen-coordinate and depth
+arithmetic. V2 does the guard-band compare, the depth clamp and the output
+register. The values fit in 48 bits (|sx|, |sy| < 2^31, |depth| < 2^34), so
+the extra registers are exact. Latency goes up by one cycle (500 vertices:
+537 -> 538 cycles). The unit test and the full-system pixel comparison still
+pass bit-exactly.
+
+**Result:** WNS went from -2.291 ns to **+0.253 ns** at 10 ns (100 MHz), with 0
+failing endpoints. The evidence is in `fpga/reports/before_viewport_split_10ns/`
+and `after_viewport_split_10ns/`. The worst remaining paths are the V1 depth
+arithmetic (18 levels) and `vertex_fetch`'s `req_left` update (19 levels, +0.47 ns),
+so those are the next targets if the clock needs to go higher.
+
+**Post-route utilization at 100 MHz** (Vivado, `after_viewport_split_10ns/util.rpt`):
+9,590 Slice LUTs (18.0%), 9,317 registers (8.8%), 98 Block RAM tiles (70.0%),
+36 DSPs (16.4%). Vivado's vectorless power estimate is 0.377 W.
+
+*BRAM finding:* Vivado uses 98 RAMB36 tiles for the two buffers, not the
+theoretical minimum of 76 that Yosys achieved. A 76,800-deep memory is not a
+power of two, and Vivado's default mapping wastes part of the depth. Splitting
+each buffer by hand into a 64K-deep and a 12K-deep part would recover most of
+it. That is future work; the design fits as is.
+
+**Windows notes:** in PowerShell, `bash` is WSL's bash, which cannot see the
+Windows Vivado install, and `python3` is the Microsoft Store placeholder.
+`fpga/sweep.ps1` calls Git Bash explicitly, and `sweep.sh` picks the first
+Python that actually runs.

@@ -22,3 +22,12 @@ build/
 *.log
 # Generated renders and reports
 out/
+
+# Vivado scratch output
+vivado*.jou
+vivado*.log
+vivado_pid*.str
+clockInfo.txt
+tight_setup_hold_pins.txt
+.Xil/
+fpga/reports/test_*/
