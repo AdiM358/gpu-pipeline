@@ -1,0 +1,9 @@
+top gpu_top
+part xc7z020clg400-1
+rast_span 4
+period_ns 10
+wns_ns 0.253
+critical_start u_persp/pz2_reg[45]/C
+critical_end u_persp/depth_v1_reg[34]/D
+critical_logic_levels 18
+vivado 2026.1

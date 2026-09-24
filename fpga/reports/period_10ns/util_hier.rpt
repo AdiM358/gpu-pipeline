@@ -1,0 +1,44 @@
+Copyright 1986-2022 Xilinx, Inc. All Rights Reserved. Copyright 2022-2026 Advanced Micro Devices, Inc. All Rights Reserved.
+---------------------------------------------------------------------------------------------------------------------------------------------
+| Tool Version : Vivado v.2026.1 (win64) Build 6511674 Tue Jun 16 11:02:23 MDT 2026
+| Date         : Thu Sep 24 13:42:24 2026
+| Host         : AdiLap running 64-bit major release  (build 9200)
+| Command      : report_utilization -hierarchical -file fpga/reports/period_10ns/util_hier.rpt
+| Design       : gpu_top
+| Device       : xc7z020clg400-1
+| Speed File   : -1
+| Design State : Routed
+---------------------------------------------------------------------------------------------------------------------------------------------
+
+Utilization Design Information
+
+Table of Contents
+-----------------
+1. Utilization by Hierarchy
+
+1. Utilization by Hierarchy
+---------------------------
+
++---------------+----------------+------------+------------+---------+------+------+--------+--------+------------+
+|    Instance   |     Module     | Total LUTs | Logic LUTs | LUTRAMs | SRLs |  FFs | RAMB36 | RAMB18 | DSP Blocks |
++---------------+----------------+------------+------------+---------+------+------+--------+--------+------------+
+| gpu_top       |          (top) |       9590 |       9364 |       4 |  222 | 9317 |     98 |      0 |         36 |
+|   (gpu_top)   |          (top) |          0 |          0 |       0 |    0 |  256 |      0 |      0 |          0 |
+|   u_ctrl      |       gpu_ctrl |        270 |        270 |       0 |    0 |   11 |      0 |      0 |          0 |
+|   u_fetch     |   vertex_fetch |        154 |        150 |       4 |    0 |  227 |      2 |      0 |          0 |
+|   u_geom      |    geom_engine |        292 |        278 |       0 |   14 |  706 |      0 |      0 |         16 |
+|   u_persp     | persp_viewport |       3270 |       3083 |       0 |  187 | 2502 |      0 |      0 |         12 |
+|     (u_persp) | persp_viewport |        936 |        899 |       0 |   37 |  494 |      0 |      0 |         12 |
+|     u_recip   |     recip_pipe |       2334 |       2184 |       0 |  150 | 2008 |      0 |      0 |          0 |
+|   u_prim      |  prim_assembly |          4 |          4 |       0 |    0 |  403 |      0 |      0 |          0 |
+|   u_rast      |     rasterizer |       1649 |       1649 |       0 |    0 | 1375 |      0 |      0 |          0 |
+|   u_regs      |      axil_regs |        826 |        826 |       0 |    0 |  676 |      0 |      0 |          0 |
+|   u_rop       |            rop |        335 |        319 |       0 |   16 |  328 |     96 |      0 |          1 |
+|     (u_rop)   |            rop |        183 |        167 |       0 |   16 |  289 |      0 |      0 |          1 |
+|     u_cbuf    |        sdp_ram |         55 |         55 |       0 |    0 |   19 |     48 |      0 |          0 |
+|     u_zbuf    |      sdp_ram_0 |        101 |        101 |       0 |    0 |   20 |     48 |      0 |          0 |
+|   u_setup     |      tri_setup |       2797 |       2792 |       0 |    5 | 2833 |      0 |      0 |          7 |
++---------------+----------------+------------+------------+---------+------+------+--------+--------+------------+
+* Note: The sum of lower-level cells may be larger than their parent cells total, due to cross-hierarchy LUT combining
+
+
