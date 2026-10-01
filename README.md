@@ -5,14 +5,17 @@
 A complete fixed-function graphics pipeline, from triangles in memory to a
 depth-tested, Gouraud-shaded image in on-chip block RAM. It targets a Zynq-7020
 (`xc7z020clg400-1`) and closes timing at **100 MHz** post-route in Vivado.
-It is verified pixel for pixel against a bit-accurate C++ reference model.
+It is verified pixel for pixel against a bit-accurate C++ reference model,
+and its depth-test unit has a UVM environment built from a written
+verification plan.
 
 ![Rotating cube and an orbiting cube passing through it, rendered by the RTL](docs/img/demo.gif)
 
 *Every frame above was produced by the RTL in simulation, read back through
 the hardware framebuffer port, and checked against the golden model.*
 
-> **Status:** this design has been simulated (Verilator) and synthesised and
+> **Status:** this design has been simulated (Verilator, and Vivado xsim for
+> the UVM environment) and synthesised and
 > implemented (Vivado, Yosys). It has **not** been run on an FPGA board.
 
 ---
@@ -24,7 +27,7 @@ the hardware framebuffer port, and checked against the golden model.*
 | **Pipeline** | AXI4 vertex fetch → 4x4 transform → perspective divide and viewport → triangle setup with culling → span rasterizer with Z and colour interpolation → depth-test ROP → colour and depth buffers |
 | **FPGA** | Fmax 100 MHz post-route; 9,590 LUTs (18%), 98 BRAM tiles (70%), 36 DSPs (16%) on the XC7Z020 |
 | **Performance** | ~993 frames/s projected for the demo scene (100,665 simulated cycles per frame at 100 MHz); depth test at 1 fragment per cycle |
-| **Verification** | bit-accurate C++ golden model; 12 self-checking tests with constrained-random AXI timing; 98.9% line coverage; CI |
+| **Verification** | bit-accurate C++ golden model; 12 self-checking tests with constrained-random AXI timing; 98.9% line coverage; CI. UVM environment for the ROP with 100% functional coverage and a bug-injection check |
 | **Software** | AXI4-Lite register interface, C header, and a C++ driver that the testbench itself uses |
 
 Measured improvements over the original version of this design (simulation):
@@ -89,6 +92,38 @@ More detail:
 
 ---
 
+## Verification
+
+Two layers, each with its own reference model:
+
+- **Whole pipeline (Verilator + C++).** Every stage and the full system are
+  compared bit-exactly with the C++ golden model under constrained-random
+  stimulus and bus timing. Every pixel, depth value and counter matches on
+  17 system-test frames and 48 demo frames. This runs in CI.
+- **ROP block level (SystemVerilog UVM 1.2).** [`tb/uvm/`](tb/uvm/README.md)
+  implements [`docs/VERIFICATION_PLAN.md`](docs/VERIFICATION_PLAN.md): seven
+  features (depth test, read-after-write forwarding, bubbles, handshake,
+  clear, screen edges, read port) and three preconditions, each with its
+  stimulus, checker and coverage. It has a constrained-random and directed
+  agent, a scoreboard with an in-order reference model that checks each
+  `frag_pass` at its exact cycle and reads back the whole framebuffer, and
+  five covergroups mapped to the plan.
+
+`tb/uvm/run_xsim.sh rop_full_test <seed>` on Vivado xsim 2026.1:
+
+| Seed | Fragments | `frag_pass` matched | Readback mismatches | Errors | Functional coverage |
+|---|---:|---:|---:|---:|---|
+| 1 | 12,890 | 3,433 / 3,433 | 0 of 153,600 | 0 | 100% (5 of 5 covergroups) |
+| 2 | 12,890 | 3,404 / 3,404 | 0 of 153,600 | 0 | 100% (5 of 5 covergroups) |
+
+To check that the scoreboard actually catches bugs, a copy of `rop.sv` with
+the distance-2 forwarding path removed fails the directed forwarding test
+with 10 errors and the full test with 13, and every `frag_pass` error names
+the cause ("distance to last write 2"). Known coverage gaps are listed in the
+plan. The UVM environment needs xsim, so it is not part of CI.
+
+---
+
 ## Build, test and synthesise
 
 The toolchain is Verilator 5.020, g++ and make. The same versions run in
@@ -114,6 +149,12 @@ fpga/sweep.sh period 10 9.5 9 8   # clock sweep -> fpga/reports/summary.md
 fpga\sweep.ps1 period 10 9 8      # same, from PowerShell
 ```
 
+UVM environment for the ROP (Vivado xsim, from Git Bash):
+
+```sh
+tb/uvm/run_xsim.sh rop_full_test 1   # any test, any seed; see tb/uvm/README.md
+```
+
 An open-source synthesis cross-check (Yosys via Docker) is described in
 [fpga/README.md](fpga/README.md).
 
@@ -126,9 +167,10 @@ rtl/        synthesizable SystemVerilog (12 modules)
 model/      bit-accurate C++ golden model
 sw/         C register header + C++ driver
 tb/         Verilator testbenches + shared harness, BFMs, scenes
+tb/uvm/     UVM 1.2 environment for the ROP (xsim)
 bench/      the original units, for before/after measurements
 fpga/       Vivado and Yosys flows, reports
-docs/       architecture, ASM charts, design notes, register map, plan
+docs/       architecture, ASM charts, design notes, register map, verification plan
 ```
 
 ---
