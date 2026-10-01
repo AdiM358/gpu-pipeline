@@ -70,8 +70,8 @@ Every phase ends with the full regression green, a commit, and a DESIGN_NOTES en
 | 6 | `rop` with forwarding and clear, `sdp_ram`, external read port; switch `gpu_top` to the new datapath; delete old modules; system scene tests compare pixel-for-pixel and counter-for-counter to the model | done |
 | 7 | Coverage (`make coverage`, per-module report, tests for uncovered branches) and GitHub Actions | done |
 | 8 | Performance: `RAST_SPAN` sweep, old-vs-new unit benches built from the `baseline` tag, rotating-cube demo, PPM to GIF | done |
-| 9 | FPGA: Vivado batch OOC synth/impl, clock sweep, reports into `fpga/reports/`; Yosys cross-check if feasible | scripts written; Vivado not available, not run; Yosys cross-check run |
-| 10 | README, METRICS, RESUME, final summary | planned |
+| 9 | FPGA: Vivado batch OOC synth/impl, clock sweep, reports into `fpga/reports/`; Yosys cross-check if feasible | done: Vivado 2026.1 post-route, Fmax 100 MHz; Yosys cross-check |
+| 10 | README and METRICS | done |
 
 ## Deliberately left out
 

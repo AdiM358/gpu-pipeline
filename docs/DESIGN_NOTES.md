@@ -1,7 +1,7 @@
 # Design notes
 
 One entry per phase: what was decided, why, and what it cost. These are the
-questions I expect in a design review or interview, answered with reasons
+questions I expect in a design review, answered with reasons
 from this design rather than generic ones.
 
 ---
@@ -506,7 +506,7 @@ k x step tables to DSPs at larger spans; Vivado may choose LUTs instead.
 
 *A tool pitfall found here:* the first version of the script also reported
 Yosys' `ltp -noff` as a logic-depth proxy. The full-design numbers
-(1,193–1,400 cells) were implausible for a pipelined design, and a check on a
+(1,193â€“1,400 cells) were implausible for a pipelined design, and a check on a
 50-stage register pipeline (length 153 after `synth_xilinx`, 5 after generic
 `synth`) showed that `ltp` walks through mapped Xilinx flip-flops. The column
 was removed and not reported. Logic depth comes only from Vivado.
@@ -579,3 +579,17 @@ neither done yet:
 1. Fold `+2^20` into the M2 register (`(p + 2^44) >>> 24 == (p >>> 24) + 2^20`,
    exact), leaving one carry chain in V1.
 2. Register the burst length in vertex fetch one cycle ahead of issue.
+
+**Numbers refreshed after the split** (all measurements re-run on commit
+`919d982`; the full output is from `make all`, `make coverage`, `make perf`,
+`make demo` and `make baseline-bench`). The extra pipeline cycle changes some
+earlier figures slightly:
+
+- coverage is 356/360 points (98.9%): the new stage added 7 points, all
+  hit, and the same 4 misses remain;
+- the demo averages 100,665 cycles per frame (was 100,663);
+- each `make perf` draw is one cycle longer. For example, the demo cube at
+  SPAN 1 / 4 takes 29,521 / 17,281 cycles.
+
+The unit throughputs and the baseline benches are unchanged. METRICS.md
+holds the current values.
